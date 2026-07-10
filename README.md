@@ -5,7 +5,7 @@ Pod-wide Sales Engineering command center for the Nerdio MSP SE team. Runs local
 - **Dashboard:** `http://localhost:3131`
 - **Docs:** [OVERVIEW.md](OVERVIEW.md) — features & workflow · [QUICK-REFERENCE.md](QUICK-REFERENCE.md) — one-page cheat sheet · [ARCHITECTURE.md](ARCHITECTURE.md) — technical reference
 - **Source repo (DEV):** [aanerdio/se-command-center](https://github.com/aanerdio/se-command-center) — where features are built
-- **Releases:** [Releases page](https://github.com/aanerdio/nerdio-se-command-center/releases) — each release has a source zip
+- **Releases:** [Installer releases](https://github.com/aanerdio/nerdio-se-command-center-installer/releases) — public repo with `install.ps1` + `update.ps1` assets on every release
 
 ---
 
@@ -36,7 +36,7 @@ Node.js, the Claude CLI, and NSSM are all installed automatically via WinGet by 
 
 ```powershell
 $tmp = "$env:TEMP\install.ps1"
-Invoke-WebRequest -Uri 'https://github.com/aanerdio/nerdio-se-command-center/releases/latest/download/install.ps1' -OutFile $tmp
+Invoke-WebRequest -Uri 'https://github.com/aanerdio/nerdio-se-command-center-installer/releases/latest/download/install.ps1' -OutFile $tmp
 powershell -ExecutionPolicy Bypass -File $tmp
 ```
 
@@ -68,7 +68,7 @@ cd $env:LOCALAPPDATA\Programs\SE-Command-Center
 ```powershell
 # B) Re-download the updater from GitHub (if your local copy is broken or missing):
 $tmp = "$env:TEMP\update.ps1"
-Invoke-WebRequest -Uri 'https://github.com/aanerdio/nerdio-se-command-center/releases/latest/download/update.ps1' -OutFile $tmp
+Invoke-WebRequest -Uri 'https://github.com/aanerdio/nerdio-se-command-center-installer/releases/latest/download/update.ps1' -OutFile $tmp
 powershell -ExecutionPolicy Bypass -File $tmp
 ```
 
