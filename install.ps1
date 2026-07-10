@@ -115,15 +115,24 @@ function Prompt-SharedRoot {
 function Install-WingetPackage {
   param(
     [string]$PackageId,
-    [string]$FriendlyName
+    [string]$FriendlyName,
+    [switch]$TryUserScopeFirst
   )
   if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
     Write-Host "  ERROR: winget not found. Install App Installer from the Microsoft Store, then re-run." -ForegroundColor Red
     return $false
   }
+
+  if ($TryUserScopeFirst) {
+    Write-Host "  Installing $FriendlyName per-user via WinGet ($PackageId --scope user)..." -ForegroundColor DarkGray
+    & winget install --id $PackageId -e --silent --scope user --accept-source-agreements --accept-package-agreements 2>&1 | Out-Null
+    $ok = ($LASTEXITCODE -eq 0) -or ($LASTEXITCODE -eq -1978335189)
+    if ($ok) { Refresh-Path; return $true }
+    Write-Host "  Per-user scope failed (exit $LASTEXITCODE) — trying machine-wide install..." -ForegroundColor DarkGray
+  }
+
   Write-Host "  Installing $FriendlyName via WinGet ($PackageId)..." -ForegroundColor DarkGray
   & winget install --id $PackageId -e --silent --accept-source-agreements --accept-package-agreements 2>&1 | Out-Null
-  # winget returns 0 on install, 2316632107 (0x8A15002B) if already installed.
   $ok = ($LASTEXITCODE -eq 0) -or ($LASTEXITCODE -eq -1978335189)
   if (-not $ok) {
     Write-Host "  WinGet exited $LASTEXITCODE for $PackageId" -ForegroundColor Yellow
@@ -203,13 +212,27 @@ function Prompt-CreateUserJson {
 Write-Host "=== SE Command Center — first-time install ===" -ForegroundColor Cyan
 Write-Host ""
 
-# --- Elevation ---
+# --- Run mode selection ---
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-if (-not $isAdmin) {
-  Write-Host "ERROR: run this from an elevated PowerShell (needs to register the Windows service)." -ForegroundColor Red
-  Write-Host "  Right-click PowerShell → Run as Administrator, then re-run:" -ForegroundColor DarkGray
-  Write-Host "  powershell -ExecutionPolicy Bypass -File `"$PSCommandPath`"" -ForegroundColor DarkGray
-  exit 1
+
+if ($isAdmin) {
+  Write-Host "  Running as Administrator." -ForegroundColor DarkGray
+  Write-Host ""
+  Write-Host "  How should the dashboard run after install?" -ForegroundColor Cyan
+  Write-Host "    [1]  Windows Service (recommended) — auto-starts at boot, runs via NSSM"
+  Write-Host "    [2]  Scheduled Task (per-user) — starts at your logon, no system-wide service"
+  Write-Host ""
+  do {
+    $modeChoice = (Read-Host "  Choice (1/2, default=1)").Trim()
+  } until ($modeChoice -in '', '1', '2')
+  $runMode = if ($modeChoice -eq '2') { 'task' } else { 'service' }
+  Write-Host ""
+} else {
+  Write-Host "  No admin privileges detected." -ForegroundColor Yellow
+  Write-Host "  Dashboard will be installed as a Scheduled Task (starts at your logon)." -ForegroundColor DarkGray
+  Write-Host "  To use a Windows Service instead, re-run this installer as Administrator." -ForegroundColor DarkGray
+  Write-Host ""
+  $runMode = 'task'
 }
 
 # --- [1/9] Shared SharePoint folder ---
@@ -227,19 +250,45 @@ Write-Host ""
 Write-Host "[2/9] Verifying Node.js..." -ForegroundColor Cyan
 Refresh-Path
 $node = Get-Command node -ErrorAction SilentlyContinue
+# Also check common per-user install locations (WinGet --scope user, nvm-windows)
 if (-not $node) {
-  Write-Host "  Node.js not found — installing OpenJS.NodeJS.LTS..." -ForegroundColor Yellow
-  if (-not (Install-WingetPackage -PackageId 'OpenJS.NodeJS.LTS' -FriendlyName 'Node.js LTS')) {
-    Write-Host "  FATAL: Node.js install failed. Install manually from https://nodejs.org and re-run." -ForegroundColor Red
+  $candidatePaths = @(
+    (Join-Path $env:LOCALAPPDATA 'Programs\nodejs\node.exe'),
+    (Join-Path $env:APPDATA 'nvm\node.exe'),
+    'C:\Program Files\nodejs\node.exe'
+  )
+  foreach ($p in $candidatePaths) {
+    if (Test-Path $p) { $node = Get-Item $p; break }
+  }
+}
+if (-not $node) {
+  Write-Host "  Node.js not found — attempting install..." -ForegroundColor Yellow
+  $installed = Install-WingetPackage -PackageId 'OpenJS.NodeJS.LTS' -FriendlyName 'Node.js LTS' -TryUserScopeFirst
+  if (-not $installed) {
+    if (-not $isAdmin) {
+      Write-Host "  FATAL: Could not install Node.js without admin." -ForegroundColor Red
+      Write-Host "  Options:" -ForegroundColor DarkGray
+      Write-Host "    - Ask IT to install Node.js LTS" -ForegroundColor DarkGray
+      Write-Host "    - Re-run this installer as Administrator" -ForegroundColor DarkGray
+      Write-Host "    - Install manually: winget install OpenJS.NodeJS.LTS --scope user" -ForegroundColor DarkGray
+    } else {
+      Write-Host "  FATAL: Node.js install failed. Install manually from https://nodejs.org and re-run." -ForegroundColor Red
+    }
     exit 4
   }
   $node = Get-Command node -ErrorAction SilentlyContinue
+  if (-not $node) {
+    # Try per-user location after install
+    $perUserNode = Join-Path $env:LOCALAPPDATA 'Programs\nodejs\node.exe'
+    if (Test-Path $perUserNode) { $node = Get-Item $perUserNode }
+  }
   if (-not $node) {
     Write-Host "  FATAL: node still not on PATH after install. Open a new PowerShell and re-run." -ForegroundColor Red
     exit 4
   }
 }
-Write-Host "  node: $($node.Source) ($((node --version)))" -ForegroundColor Green
+$nodeVersion = if ($node -is [System.IO.FileInfo]) { & $node.FullName --version } else { & node --version }
+Write-Host "  node: $(if ($node -is [System.IO.FileInfo]) { $node.FullName } else { $node.Source }) ($nodeVersion)" -ForegroundColor Green
 
 # --- [3/9] Claude Code (auto-install via WinGet if missing) ---
 Write-Host ""
@@ -249,7 +298,7 @@ $claudeBin = Join-Path $env:USERPROFILE '.local\bin\claude.exe'
 $claudeOnPath = Get-Command claude -ErrorAction SilentlyContinue
 if ((-not (Test-Path $claudeBin)) -and (-not $claudeOnPath)) {
   Write-Host "  Claude Code not found — installing Anthropic.ClaudeCode..." -ForegroundColor Yellow
-  if (-not (Install-WingetPackage -PackageId 'Anthropic.ClaudeCode' -FriendlyName 'Claude Code')) {
+  if (-not (Install-WingetPackage -PackageId 'Anthropic.ClaudeCode' -FriendlyName 'Claude Code' -TryUserScopeFirst)) {
     Write-Host "  WARNING: Claude Code install failed. Dashboard will run but AI features stay disabled until installed." -ForegroundColor Yellow
   } else {
     $claudeOnPath = Get-Command claude -ErrorAction SilentlyContinue
@@ -309,17 +358,46 @@ try {
   node scripts\setup.js
 } finally { Pop-Location }
 
-# --- [9/9] Register NSSM service ---
+# --- [9/9] Register service or scheduled task ---
 Write-Host ""
-Write-Host "[9/9] Registering NSSM Windows service..." -ForegroundColor Cyan
-Push-Location $ProdDir
-try {
-  & (Join-Path $ProdDir 'service\install-service.ps1')
-} finally { Pop-Location }
+if ($runMode -eq 'service') {
+  Write-Host "[9/9] Registering Windows service (NSSM)..." -ForegroundColor Cyan
+  Push-Location $ProdDir
+  try {
+    & (Join-Path $ProdDir 'service\install-service.ps1')
+  } finally { Pop-Location }
+} else {
+  Write-Host "[9/9] Registering Scheduled Task (per-user, at logon)..." -ForegroundColor Cyan
+  Push-Location $ProdDir
+  try {
+    & (Join-Path $ProdDir 'service\install-task.ps1')
+  } finally { Pop-Location }
+}
+
+# --- Persist run_mode to install-config.json ---
+$cfgExisting = $null
+if (Test-Path $InstallConfig) {
+  try { $cfgExisting = Get-Content $InstallConfig -Raw | ConvertFrom-Json } catch {}
+}
+$savedSharedRoot = if ($cfgExisting -and $cfgExisting.shared_root) { $cfgExisting.shared_root } else { $SharedRoot }
+$cfgNew = [ordered]@{
+  shared_root = $savedSharedRoot
+  run_mode    = $runMode
+  saved_at    = (Get-Date).ToString('o')
+}
+($cfgNew | ConvertTo-Json) | Set-Content -Path $InstallConfig -Encoding UTF8
 
 Write-Host ""
 Write-Host "=== Install complete ===" -ForegroundColor Green
 Write-Host "  PROD install: $ProdDir"
 Write-Host "  Dashboard:    http://localhost:3131"
+Write-Host "  Run mode:     $runMode"
 Write-Host ""
-Write-Host "For future updates, run:  .\update.ps1  from $ProdDir (elevated)."
+if ($runMode -eq 'task') {
+  Write-Host "  The dashboard starts automatically at your next logon."
+  Write-Host "  To start it now:  Start-ScheduledTask 'SE Dashboard'"
+  Write-Host ""
+  Write-Host "For future updates, run:  .\update.ps1  from $ProdDir (no admin needed)."
+} else {
+  Write-Host "For future updates, run:  .\update.ps1  from $ProdDir (elevated)."
+}
