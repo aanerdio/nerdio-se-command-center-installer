@@ -10,7 +10,7 @@
 #
 # Or re-download the latest updater from GitHub if your local copy is broken:
 #   $tmp = "$env:TEMP\update.ps1"
-#   Invoke-WebRequest -Uri 'https://github.com/aanerdio/nerdio-se-command-center/releases/latest/download/update.ps1' -OutFile $tmp
+#   Invoke-WebRequest -Uri 'https://github.com/aanerdio/nerdio-se-command-center-installer/releases/latest/download/update.ps1' -OutFile $tmp
 #   powershell -ExecutionPolicy Bypass -File $tmp
 #
 # Safe to re-run. Preserves: data\, logs\, config\pod-roster.json, node_modules\.
