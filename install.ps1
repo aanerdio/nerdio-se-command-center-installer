@@ -4,7 +4,7 @@
 # elevated PowerShell:
 #
 #   $tmp = "$env:TEMP\install.ps1"
-#   Invoke-WebRequest -Uri 'https://github.com/aanerdio/nerdio-se-command-center/releases/latest/download/install.ps1' -OutFile $tmp
+#   Invoke-WebRequest -Uri 'https://github.com/aanerdio/nerdio-se-command-center-installer/releases/latest/download/install.ps1' -OutFile $tmp
 #   powershell -ExecutionPolicy Bypass -File $tmp
 #
 # You do NOT need to sync SharePoint first — this script prompts you to
