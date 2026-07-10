@@ -30,6 +30,23 @@ $LocalVer   = Join-Path $RepoRoot 'version.json'
 $SharedPod  = Join-Path $SharedRoot 'knowledge\domain\pod-assignments.json'
 $ServiceName = 'SE Dashboard'
 
+# --- Load install-config.json (run_mode, optional shared_root override) ---
+$PersonalRoot  = Join-Path $env:USERPROFILE 'OneDrive - Nerdio\SE-Command-Center'
+$InstallConfig = Join-Path $PersonalRoot 'install-config.json'
+$runMode = 'service'  # default — backward compatible with existing installs
+if (Test-Path $InstallConfig) {
+  try {
+    $cfg = Get-Content $InstallConfig -Raw | ConvertFrom-Json
+    if ($cfg.run_mode) { $runMode = $cfg.run_mode }
+    if ($cfg.shared_root -and (Test-Path (Join-Path $cfg.shared_root 'app'))) {
+      $SharedRoot = $cfg.shared_root
+      $SharedApp  = Join-Path $SharedRoot 'app'
+      $SharedVer  = Join-Path $SharedApp 'version.json'
+      $SharedPod  = Join-Path $SharedRoot 'knowledge\domain\pod-assignments.json'
+    }
+  } catch {}
+}
+
 # DEV safety guard: refuse to overwrite the git-tracked DEV workspace.
 # Anthony/Marcos use publish.ps1 from DEV → then update.ps1 from PROD.
 if ($RepoRoot -like 'C:\Claude\Projects\SE-Command-Center*') {
@@ -39,10 +56,12 @@ if ($RepoRoot -like 'C:\Claude\Projects\SE-Command-Center*') {
   exit 10
 }
 
-# --- Elevation check ---
+# --- Elevation check (only required for service mode) ---
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-if (-not $isAdmin) {
-  Write-Host 'ERROR: run this from an elevated PowerShell (needs Stop/Start-Service).' -ForegroundColor Red
+if ($runMode -eq 'service' -and -not $isAdmin) {
+  Write-Host "ERROR: service mode requires an elevated PowerShell (needs Stop/Start-Service)." -ForegroundColor Red
+  Write-Host "  Your install-config.json at $InstallConfig has run_mode='service'." -ForegroundColor DarkGray
+  Write-Host "  Re-run elevated, or run install.ps1 without admin to switch to Scheduled Task mode." -ForegroundColor DarkGray
   exit 1
 }
 
@@ -85,14 +104,24 @@ $sharedPodHash = if (Test-Path $SharedPod) {
   (Get-FileHash $SharedPod -Algorithm SHA256).Hash.ToLower()
 } else { '' }
 
-# --- Stop service ---
-$svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
-$svcWasRunning = $false
-if ($svc -and $svc.Status -eq 'Running') {
-  Write-Host "  Stopping service..." -ForegroundColor DarkGray
-  Stop-Service -Name $ServiceName -Force
-  $svcWasRunning = $true
-  Start-Sleep -Seconds 2
+# --- Stop service / task ---
+$wasRunning = $false
+if ($runMode -eq 'task') {
+  $task = Get-ScheduledTask -TaskName $ServiceName -ErrorAction SilentlyContinue
+  if ($task -and $task.State -eq 'Running') {
+    Write-Host "  Stopping scheduled task..." -ForegroundColor DarkGray
+    Stop-ScheduledTask -TaskName $ServiceName
+    $wasRunning = $true
+    Start-Sleep -Seconds 2
+  }
+} else {
+  $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+  if ($svc -and $svc.Status -eq 'Running') {
+    Write-Host "  Stopping service..." -ForegroundColor DarkGray
+    Stop-Service -Name $ServiceName -Force
+    $wasRunning = $true
+    Start-Sleep -Seconds 2
+  }
 }
 
 # --- Sync from shared ---
@@ -103,7 +132,9 @@ $rc = robocopy $SharedApp $RepoRoot /MIR `
   /NFL /NDL /NP /R:2 /W:1
 if ($LASTEXITCODE -ge 8) {
   Write-Host "FATAL: robocopy failed with exit code $LASTEXITCODE" -ForegroundColor Red
-  if ($svcWasRunning) { Start-Service -Name $ServiceName }
+  if ($wasRunning) {
+    if ($runMode -eq 'task') { Start-ScheduledTask -TaskName $ServiceName } else { Start-Service -Name $ServiceName }
+  }
   exit $LASTEXITCODE
 }
 Copy-Item -Path $SharedVer -Destination $LocalVer -Force
@@ -132,15 +163,29 @@ if ($sharedPodHash -ne $localPodHash) {
   } finally { Pop-Location }
 }
 
-# --- Restart service ---
-if ($svc) {
-  Write-Host "  Starting service..." -ForegroundColor Cyan
-  Start-Service -Name $ServiceName
-  Start-Sleep -Seconds 2
-  $svc = Get-Service -Name $ServiceName
-  Write-Host "  Service status: $($svc.Status)" -ForegroundColor Green
+# --- Restart service / task ---
+if ($runMode -eq 'task') {
+  $task = Get-ScheduledTask -TaskName $ServiceName -ErrorAction SilentlyContinue
+  if ($task) {
+    Write-Host "  Starting scheduled task..." -ForegroundColor Cyan
+    Start-ScheduledTask -TaskName $ServiceName
+    Start-Sleep -Seconds 2
+    $task = Get-ScheduledTask -TaskName $ServiceName
+    Write-Host "  Task state: $($task.State)" -ForegroundColor Green
+  } else {
+    Write-Host "  Scheduled task not installed. Run .\service\install-task.ps1 to register it." -ForegroundColor Yellow
+  }
 } else {
-  Write-Host "  Service not installed yet. Run .\service\install-service.ps1 to register it." -ForegroundColor Yellow
+  $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+  if ($svc) {
+    Write-Host "  Starting service..." -ForegroundColor Cyan
+    Start-Service -Name $ServiceName
+    Start-Sleep -Seconds 2
+    $svc = Get-Service -Name $ServiceName
+    Write-Host "  Service status: $($svc.Status)" -ForegroundColor Green
+  } else {
+    Write-Host "  Service not installed yet. Run .\service\install-service.ps1 to register it." -ForegroundColor Yellow
+  }
 }
 
 Write-Host ''
