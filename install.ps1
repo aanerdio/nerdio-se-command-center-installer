@@ -202,7 +202,9 @@ function Prompt-CreateUserJson {
     sf_owner_name = $sfOwner
   }
   $userJsonText = $userObj | ConvertTo-Json
-  Set-Content -Path $UserJsonPath -Value $userJsonText -Encoding UTF8
+  # Use no-BOM UTF-8. PowerShell 5.1's -Encoding UTF8 writes a BOM that breaks
+  # Node.js JSON.parse — use .NET directly to guarantee no BOM.
+  [System.IO.File]::WriteAllText($UserJsonPath, $userJsonText, [System.Text.UTF8Encoding]::new($false))
   Write-Host ""
   Write-Host "  Wrote $UserJsonPath" -ForegroundColor Green
   Write-Host $userJsonText -ForegroundColor DarkGray
