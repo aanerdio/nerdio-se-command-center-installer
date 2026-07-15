@@ -11,21 +11,29 @@
 # sync (or point at a custom path) if the shared tool folder is missing.
 #
 # What it does:
-#   1. Verifies the shared SharePoint tool folder is synced locally, or lets
-#      the user open the SP site in a browser to sync it, or point to a
-#      custom local path (persisted in install-config.json).
+#   1. Verifies the shared SharePoint tool folder is synced locally — both the
+#      app\ subfolder AND the knowledge\ subfolder (setup.js needs
+#      pod-assignments.json). If missing, lets the user open the SP site in a
+#      browser to sync it, or point to a custom local path (persisted in
+#      install-config.json).
 #   2. Installs Node.js LTS via WinGet if missing.
 #   3. Installs Claude Code (Anthropic.ClaudeCode) via WinGet if missing.
 #   4. If %USERPROFILE%\OneDrive - Nerdio\SE-Command-Center\user.json is missing,
 #      prompts the installer for name/email (validated against the shared
 #      pod-assignments.json) and writes it.
+#   4b. Seeds personal profile stubs (voice-profile.md, background.md) with
+#       Nerdio-SE-baseline content — SE fills in personal specifics.
+#   4c. Reminds the SE to connect Microsoft 365 integration in claude.ai
+#       (non-blocking).
 #   5. Creates the per-user PROD install at %LOCALAPPDATA%\Programs\SE-Command-Center\.
 #   6. Robocopies the app code from shared\app\ into that folder.
 #   7. Runs npm install.
 #   8. Runs scripts\setup.js to generate config\pod-roster.json.
-#   9. Registers the NSSM Windows service pointing at the PROD install.
+#   9. Registers the NSSM Windows service (or Scheduled Task) pointing at
+#      the PROD install.
 #
 # Idempotent — safe to re-run. Won't clobber data\ or an existing user.json.
+# Won't overwrite already-populated profile files.
 
 $ErrorActionPreference = 'Stop'
 
@@ -263,9 +271,57 @@ $SharedRoot = Resolve-SharedRoot
 if (-not $SharedRoot) {
   $SharedRoot = Prompt-SharedRoot
 }
-$SharedApp      = Join-Path $SharedRoot 'app'
-$PodAssignments = Join-Path $SharedRoot 'knowledge\domain\pod-assignments.json'
+$SharedApp       = Join-Path $SharedRoot 'app'
+$SharedKnowledge = Join-Path $SharedRoot 'knowledge'
+$PodAssignments  = Join-Path $SharedRoot 'knowledge\domain\pod-assignments.json'
 Write-Host "  Shared root: $SharedRoot" -ForegroundColor Green
+
+# Ensure personal root exists so we can pin it below alongside the shared root.
+# (It's also created lazily later by Prompt-CreateUserJson / profile seed, but
+# pinning needs the folder to physically exist first.)
+if (-not (Test-Path $PersonalRoot)) {
+  New-Item -ItemType Directory -Force -Path $PersonalRoot | Out-Null
+}
+
+# Files On-Demand safeguard. Both SE roots live in OneDrive; if any content is
+# left as cloud-only placeholders, downstream steps (setup.js reading
+# pod-assignments.json, robocopy of app\, skills reading the profile) can fail
+# with "file not found" even though it "exists" in OneDrive. Pinning both roots
+# with `attrib +p` is the programmatic equivalent of right-click ->
+# "Always keep on this device". Idempotent — pinning already-pinned files is a
+# no-op — so safe to re-run.
+Write-Host "  Pinning OneDrive folders (Always keep on this device)..." -ForegroundColor DarkGray
+& attrib.exe +p $SharedRoot   /s /d 2>$null | Out-Null
+& attrib.exe +p $PersonalRoot /s /d 2>$null | Out-Null
+
+# Even with the pin in place, OneDrive materializes files asynchronously.
+# setup.js needs pod-assignments.json specifically — wait up to 60s for it.
+if (-not (Test-Path $PodAssignments)) {
+  Write-Host "  Waiting for OneDrive to sync knowledge\ subfolder (up to 60s)..." -ForegroundColor Yellow
+  $deadline = (Get-Date).AddSeconds(60)
+  while (-not (Test-Path $PodAssignments) -and (Get-Date) -lt $deadline) {
+    Start-Sleep -Milliseconds 500
+  }
+}
+if (-not (Test-Path $PodAssignments)) {
+  Write-Host ""
+  Write-Host "  ERROR: pod-assignments.json is missing at:" -ForegroundColor Red
+  Write-Host "    $PodAssignments" -ForegroundColor DarkGray
+  Write-Host ""
+  Write-Host "  The 'app\' folder is synced but 'knowledge\' is not. This is usually" -ForegroundColor Yellow
+  Write-Host "  a OneDrive selective-sync issue — the installer pinned the folder to" -ForegroundColor Yellow
+  Write-Host "  force download but OneDrive didn't materialize it in time." -ForegroundColor Yellow
+  Write-Host ""
+  Write-Host "  Fix (manual):" -ForegroundColor Cyan
+  Write-Host "    1. In the Explorer window that just opened, right-click 'knowledge'" -ForegroundColor DarkGray
+  Write-Host "    2. Select 'Always keep on this device'" -ForegroundColor DarkGray
+  Write-Host "    3. Wait for the sync (blue circle turns to a green check)" -ForegroundColor DarkGray
+  Write-Host "    4. Re-run install.ps1" -ForegroundColor DarkGray
+  Write-Host ""
+  # Open File Explorer at the shared root so the user can act immediately.
+  explorer.exe $SharedRoot
+  exit 10
+}
 
 # --- [2/9] Node.js (auto-install via WinGet if missing) ---
 Write-Host ""
@@ -346,10 +402,13 @@ if (-not (Test-Path $UserJson)) {
 # --- [4b/9] Seed personal profile stubs (voice-profile.md, background.md) ---
 # SE Command Center skills (se-email-reply, se-post-call-refine-email,
 # se-post-call-sf-update) read voice + background from the personal profile
-# folder. Seed empty templates so the SE has something to fill in — an empty
-# template is better than no file (skills silently fall back to generic tone).
+# folder. We seed them with Nerdio-SE-baseline content — the universal
+# conventions (email rules, vocabulary, role, audience) are populated so the
+# skills have something real to work with even before the SE personalizes,
+# while personal specifics (tone, experience, territory, strengths) stay as
+# <angle-bracket> prompts.
 Write-Host ""
-Write-Host "  Seeding personal profile stubs..." -ForegroundColor Cyan
+Write-Host "[4b/9] Seeding personal profile stubs..." -ForegroundColor Cyan
 $ProfileDir = Join-Path $PersonalRoot 'profile'
 if (-not (Test-Path $ProfileDir)) {
   New-Item -ItemType Directory -Force -Path $ProfileDir | Out-Null
@@ -359,66 +418,136 @@ $voiceTemplate = @'
 # Voice Profile — <Your Name>
 
 The SE Command Center reads this file when drafting emails, SF notes, and
-follow-ups on your behalf. Fill it in so those outputs sound like you, not a
-generic template.
+follow-ups on your behalf. Fill it in so those outputs sound like you.
 
-## Tone
-<How do you write? Direct? Warm? Technical? A few sentences describing your default tone.>
+**Below is the Nerdio SE communication baseline pulled from our templates and
+guides. Some of it is convention (keep it); some is personal preference
+(change freely).**
+
+## Email — universal rules (keep)
+- Never open with "Hope this finds you well" or "Hope you're doing well."
+- One topic per email. If you have two topics, send two emails.
+- Answer first, then context. Don't build up to the point.
+- Standalone email (starts a thread): open with the person's first name for
+  known contacts (`Libis,`) or `Good morning` / `Good afternoon` for first
+  contact. Close with `Thank you,` above your name.
+- Mid-thread reply: no opener, no closer. Answer directly. Only add a label
+  for an attachment (e.g. `Cost Estimate` on the file line).
+- Always CC the PSM on customer-facing follow-ups.
+
+## Email — personal tone
+<Direct? Warm? Formal? Two or three sentences. Include what NOT to sound like.>
 
 ## Vocabulary
-<Words and phrases you use often. Words you avoid.>
+- **Partner** (not customer) when talking to MSPs.
+- **PoV** (not POC, not "proof of concept").
+- **Session host** (not VM) when talking about AVD hosts.
+- **NMM** (not "Nerdio Manager for MSP" in shorthand after first reference).
+- **Pod** (not team) for the sales unit.
+- Avoid: "leverage", "synergy", "circle back", "reach out" as a verb, "utilize".
 
 ## Signature phrases
-<Openers, closers, or transitions you use consistently.>
+<Openers and closers you use consistently. Examples: "Following up on...",
+"Quick recap from our call —", "Let me know if this misses anything.">
 
 ## Formatting habits
-<Bullets vs prose? Short paragraphs vs long? Emoji use?>
+- Short paragraphs (2–3 sentences).
+- Bullets when comparing options or listing 3+ items.
+- No emoji in customer-facing writing.
+- Bold sparingly — for the one number or thing you want them to remember.
+
+## On calls
+- Answer first, then explain.
+- Check in after major sections ("Any questions around X?" before moving on).
+- Don't defend a high cost estimate — pull a lever, show the new number.
+- If asked about commercials on a call, quote AVD retail ($12/user) and hand
+  the pricing conversation to the PSM.
+
+## Boundaries
+- If you don't know, say so. No hedging with "I believe" or "I think it might."
+- If it's outside our product (their Azure tenant config, their M365 tenant
+  policy edge case), say what you can and can't help with directly.
 
 ## Examples
-Paste 2–3 short emails you actually sent and are happy with. These anchor the
-voice better than any description.
+<Paste 2–3 short emails you actually sent and are happy with. These anchor your
+personal voice better than any description above.>
 '@
 
 $backgroundTemplate = @'
 # Background — <Your Name>
 
 Context about you, your role, and what you bring to customer conversations.
-Used by skills to inform how they frame technical content.
+The SE Command Center reads this file so skills frame technical content in
+your emails, SF notes, and briefs the way you'd want them framed.
+
+**Edit anything below to match you. The role/audience sections are Nerdio SE
+defaults and should stay mostly true. The personal sections need your input.**
 
 ## Role
-Sales Engineer at Nerdio. Primary domain: <AVD / M365 / both>.
+Sales Engineer at Nerdio, MSP Sales Team. Pre-sales technical owner for the
+opportunities in my pod — engaged once an opp is qualified in Salesforce with a
+clear technical need. Primary responsibilities:
+
+- AVD Cost Estimates (scoping sessions using the Nerdio Cost Estimator)
+- Technical demos (AVD, M365)
+- Proof of Value engagements (structured validation)
+- Objection handling (Citrix, native Azure, "why Nerdio")
+- Clean technical handoff to the Go-Live Engineering (GLE) team at close
+
+I own **technical validation, not commercials.** MSP pricing, discounts, and
+licensing volume conversations go to the PSM. The only price I quote directly
+is AVD retail: **$12/user/month**.
+
+## Audience
+Managed Service Providers (MSPs) — technical evaluators, ops leads, and CTOs.
+They care about multi-tenant management, per-tenant margin, and reducing manual
+Azure work. They're not end-user IT and they're not Enterprise IT — the tone
+should reflect a peer-to-peer technical conversation.
+
+## Primary domain
+<AVD / M365 / both — most SEs specialize over time.>
 
 ## Experience
-<What you did before Nerdio. Years in the industry. Relevant certifications.>
+<Years in the industry, roles before Nerdio, relevant certifications
+(AZ-140, MS-100, etc.), any past MSP-side experience.>
 
-## Territory / focus
-<Region, pod, product focus.>
+## Territory / pod
+<Region (NA-East, NA-West, EMEA, APAC) and pod number. Should match your
+entry in pod-assignments.json.>
 
 ## Strengths
-<What you are especially good at. Topics where you go deep.>
+<Topics where you're the go-to on the pod. Examples: image management at scale,
+FSLogix profile design, NMM RBAC modeling, M365 tenant carving, PoV facilitation.
+Two or three is plenty.>
+
+## What I defer on
+<What you route to someone else instead of answering yourself. Common ones for
+new SEs: deep M365 policy edge cases, novel PowerShell, product roadmap
+timelines, licensing commercials (always PSM).>
 '@
 
 $profileFiles = @(
   @{ Path = (Join-Path $ProfileDir 'voice-profile.md'); Content = $voiceTemplate      },
   @{ Path = (Join-Path $ProfileDir 'background.md');    Content = $backgroundTemplate }
 )
+$profileSeededAny = $false
 foreach ($f in $profileFiles) {
   if (-not (Test-Path $f.Path)) {
     [System.IO.File]::WriteAllText($f.Path, $f.Content, [System.Text.UTF8Encoding]::new($false))
     Write-Host "    Seeded: $(Split-Path $f.Path -Leaf)" -ForegroundColor Green
+    $profileSeededAny = $true
   } else {
     Write-Host "    Exists: $(Split-Path $f.Path -Leaf)" -ForegroundColor DarkGray
   }
 }
 Write-Host "  Personal profile: $ProfileDir" -ForegroundColor Green
-Write-Host "  Fill in the stubs so post-call emails and SF notes sound like you." -ForegroundColor DarkGray
 
 # --- [4c/9] Microsoft 365 MCP reminder ---
 # The dashboard's calendar, emails, meeting invites, and email drafting all flow
 # through the claude.ai-hosted Microsoft 365 integration. It's a one-time browser
 # OAuth per SE. Non-blocking — the installer just reminds the SE to do it.
 Write-Host ""
-Write-Host "  Microsoft 365 integration in claude.ai:" -ForegroundColor Cyan
+Write-Host "[4c/9] Microsoft 365 integration in claude.ai..." -ForegroundColor Cyan
 Write-Host "    The dashboard's calendar, emails, and Reply-in-Outlook flow all go through" -ForegroundColor DarkGray
 Write-Host "    the M365 integration on claude.ai. If you haven't enabled it yet:" -ForegroundColor DarkGray
 Write-Host ""
@@ -509,6 +638,24 @@ Write-Host "  PROD install: $ProdDir"
 Write-Host "  Dashboard:    http://localhost:3131"
 Write-Host "  Run mode:     $runMode"
 Write-Host ""
+
+# Profile personalization reminder — call it out prominently because empty or
+# default profile files degrade the quality of every skill that reads them.
+Write-Host "  One more step — personalize your SE profile:" -ForegroundColor Yellow
+Write-Host "    profile\voice-profile.md   — how you write (tone, vocab, formatting)" -ForegroundColor Yellow
+Write-Host "    profile\background.md      — who you are (role, experience, focus)" -ForegroundColor Yellow
+Write-Host "  Both were seeded with Nerdio-SE defaults. Edit them so emails and SF" -ForegroundColor DarkGray
+Write-Host "  notes sound like YOU, not the template." -ForegroundColor DarkGray
+Write-Host "  Location: $ProfileDir" -ForegroundColor DarkGray
+if ($profileSeededAny) {
+  # Open File Explorer on the profile folder so the SE lands on the files to
+  # edit. Bare `explorer.exe` (not Start-Process) so the window opens in the
+  # user's normal, unelevated shell session even if install.ps1 is elevated.
+  explorer.exe $ProfileDir
+  Write-Host "  (opened for you in Explorer)" -ForegroundColor DarkGray
+}
+Write-Host ""
+
 if ($runMode -eq 'task') {
   Write-Host "  The dashboard starts automatically at your next logon."
   Write-Host "  To start it now:  Start-ScheduledTask 'SE Dashboard'"
