@@ -21,31 +21,45 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-$RepoRoot   = $PSScriptRoot
-$SharedRoot = Join-Path $env:USERPROFILE `
-  'OneDrive - Nerdio\MSP Sales Team - Sales Engineering - Sales Engineering\00 - Team Resources\Claude\Tools\se-command-center'
-$SharedApp  = Join-Path $SharedRoot 'app'
-$SharedVer  = Join-Path $SharedApp 'version.json'
-$LocalVer   = Join-Path $RepoRoot 'version.json'
-$SharedPod  = Join-Path $SharedRoot 'knowledge\domain\pod-assignments.json'
+$RepoRoot    = $PSScriptRoot
 $ServiceName = 'SE Dashboard'
 
-# --- Load install-config.json (run_mode, optional shared_root override) ---
-$PersonalRoot  = Join-Path $env:USERPROFILE 'OneDrive - Nerdio\SE-Command-Center'
+# Known OneDrive sync path variants — probe in order, first match wins.
+$CANDIDATE_SHARED_ROOTS = @(
+  (Join-Path $env:USERPROFILE 'OneDrive - Nerdio\MSP Sales Team - Sales Engineering - Sales Engineering\00 - Team Resources\Claude\Tools\se-command-center'),
+  (Join-Path $env:USERPROFILE 'Nerdio\MSP Sales Team - Sales Engineering - Documents\Sales Engineering\00 - Team Resources\Claude\Tools\se-command-center')
+)
+
+# Personal root varies by OneDrive folder name — try both.
+$PersonalRoot = @(
+  (Join-Path $env:USERPROFILE 'OneDrive - Nerdio\SE-Command-Center'),
+  (Join-Path $env:USERPROFILE 'Nerdio\SE-Command-Center')
+) | Where-Object { Test-Path $_ } | Select-Object -First 1
+if (-not $PersonalRoot) { $PersonalRoot = Join-Path $env:USERPROFILE 'OneDrive - Nerdio\SE-Command-Center' }
+
 $InstallConfig = Join-Path $PersonalRoot 'install-config.json'
 $runMode = 'service'  # default — backward compatible with existing installs
+
+# --- Load install-config.json (run_mode, optional shared_root override) ---
+$SharedRoot = $null
 if (Test-Path $InstallConfig) {
   try {
     $cfg = Get-Content $InstallConfig -Raw | ConvertFrom-Json
     if ($cfg.run_mode) { $runMode = $cfg.run_mode }
     if ($cfg.shared_root -and (Test-Path (Join-Path $cfg.shared_root 'app'))) {
       $SharedRoot = $cfg.shared_root
-      $SharedApp  = Join-Path $SharedRoot 'app'
-      $SharedVer  = Join-Path $SharedApp 'version.json'
-      $SharedPod  = Join-Path $SharedRoot 'knowledge\domain\pod-assignments.json'
     }
   } catch {}
 }
+# Fall back to candidate probe if no override resolved.
+if (-not $SharedRoot) {
+  $SharedRoot = $CANDIDATE_SHARED_ROOTS | Where-Object { Test-Path (Join-Path $_ 'app') } | Select-Object -First 1
+}
+
+$SharedApp  = Join-Path $SharedRoot 'app'
+$SharedVer  = Join-Path $SharedApp 'version.json'
+$LocalVer   = Join-Path $RepoRoot 'version.json'
+$SharedPod  = Join-Path $SharedRoot 'knowledge\domain\pod-assignments.json'
 
 # DEV safety guard: refuse to overwrite the git-tracked DEV workspace.
 # Anthony/Marcos use publish.ps1 from DEV → then update.ps1 from PROD.
@@ -144,7 +158,17 @@ $newPkgHash = (Get-FileHash (Join-Path $RepoRoot 'package.json') -Algorithm SHA2
 if ($localPkgHash -ne $newPkgHash) {
   Write-Host "  package.json changed — running npm install..." -ForegroundColor Cyan
   Push-Location $RepoRoot
-  try { npm install } finally { Pop-Location }
+  try {
+    npm install
+    if ($LASTEXITCODE -ne 0) {
+      Write-Host "  FATAL: npm install failed (exit $LASTEXITCODE)" -ForegroundColor Red
+      Pop-Location
+      if ($wasRunning) {
+        if ($runMode -eq 'task') { Start-ScheduledTask -TaskName $ServiceName } else { Start-Service -Name $ServiceName }
+      }
+      exit 8
+    }
+  } finally { Pop-Location }
 }
 
 # --- Re-run setup.js if pod-assignments changed ---
@@ -159,7 +183,7 @@ if ($sharedPodHash -ne $localPodHash) {
       checked_at = (Get-Date).ToString('o')
       source     = $SharedPod
     } | ConvertTo-Json
-    Set-Content -Path $snapshotPath -Value $snapshotJson -Encoding UTF8 -Force
+    [System.IO.File]::WriteAllText($snapshotPath, $snapshotJson, [System.Text.UTF8Encoding]::new($false))
   } finally { Pop-Location }
 }
 
