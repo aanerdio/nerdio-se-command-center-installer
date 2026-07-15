@@ -171,7 +171,10 @@ function Prompt-CreateUserJson {
     Write-Host "  Cannot identify SEs without it. Ask Anthony or Marcos." -ForegroundColor DarkGray
     exit 6
   }
-  $pods = @(Get-Content $PodAssignmentsPath -Raw | ConvertFrom-Json)
+  # Note: @(... | ConvertFrom-Json) is broken in Windows PowerShell 5.1 — it wraps the
+  # whole array as a single element. Parse into a variable first, then wrap with @().
+  $podsParsed = Get-Content $PodAssignmentsPath -Raw | ConvertFrom-Json
+  $pods = @($podsParsed)
 
   # Pretty-print the numbered menu
   Write-Host "  Which SE is this install for?" -ForegroundColor Cyan
