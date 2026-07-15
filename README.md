@@ -29,8 +29,22 @@ All data lives locally in per-user OneDrive; team pipeline data comes from a sha
 **Prerequisites:**
 - Windows 11
 - Elevated PowerShell
+- **Microsoft 365 integration enabled in claude.ai** (see below — needed for calendar, emails, and meeting invites)
 
 Node.js, the Claude CLI, and NSSM are all installed automatically via WinGet by the installer. You do **not** need to sync SharePoint first — the installer will walk you through that if the shared tool folder isn't already on disk.
+
+### Enable the Microsoft 365 integration in claude.ai
+
+This is the only external service the dashboard talks to. One-time setup, ~30 seconds:
+
+1. Open **[https://claude.ai/settings/integrations](https://claude.ai/settings/integrations)** in a browser signed into your Nerdio account.
+2. Find **Microsoft 365** and click **Enable** (or **Connect**).
+3. Complete the browser OAuth prompt with your `@getnerdio.com` account.
+4. Confirm the integration shows as **Connected**.
+
+That's it — the dashboard's calendar, emails, meeting invites, and email drafting all flow through this integration. If the connection ever breaks, the dashboard's data widgets stop refreshing until you re-enable it here.
+
+**No other MCPs required.** The dashboard does **not** need the local Outlook COM MCP, HubSpot MCP, or any Entra app registration.
 
 **Steps** (elevated PowerShell):
 
@@ -114,7 +128,10 @@ Only Anthony + Marcos can write to the shared pipeline store — everyone else's
 | Service won't start after update | Check `service\logs\dashboard.log`; verify Node.js is on PATH for the service account. |
 | `sf-pipeline-store.json not found` | The shared SharePoint folder isn't synced. Confirm `%USERPROFILE%\OneDrive - Nerdio\MSP Sales Team - Sales Engineering - Sales Engineering\00 - Team Resources\Claude\Tools\se-command-center\data\` exists and contains the file. |
 | Skill stuck / spinner won't clear | POST to `/api/cancel-processing` or delete `data\processing.json` under your personal `SE-Command-Center\`. Check `logs\skill-*.log`. |
-| Meeting Prep tab shows no SF link | Match failed — the meeting may need to be manually associated. Check the calendar event's attendee list. |
+| Meeting Prep says "skipped" | The skill decided the meeting isn't SE work — internal Nerdio meeting, no SF opp, wrong stage (still Discovery), or the opp is already closed. Reason line explains why. Click **Run Anyway** if you want to force full prep. |
+| Meeting Prep shows red **NO OPPORTUNITY** banner | Prep ran but no SF opp matched. Either you clicked Run Anyway, or attendee domains didn't hit anything in `sf-pipeline-store.json`. Double-check the account before pasting the SF note. |
+| Needs Attention: nothing happens on "Reply in Outlook" | The button copies the drafted body to your clipboard and opens the original message in Outlook Web. Ctrl+V into the reply pane. If nothing opens, check your browser's popup blocker. |
+| Calendar / Emails widgets stay empty | Verify the Microsoft 365 integration is still connected at [claude.ai/settings/integrations](https://claude.ai/settings/integrations). All calendar/email data flows through it. |
 
 For deeper issues see the full troubleshooting reference in the DEV repo README, or ping Anthony / Marcos.
 
