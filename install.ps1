@@ -30,11 +30,25 @@
 $ErrorActionPreference = 'Stop'
 
 $SP_SITE_URL = 'https://nerdio1013.sharepoint.com/sites/MSPSalesTeam290-SalesEngineering/Shared%20Documents/Forms/AllItems.aspx?id=%2Fsites%2FMSPSalesTeam290%2DSalesEngineering%2FShared%20Documents%2FSales%20Engineering&p=true&ga=1'
-$DEFAULT_SHARED_ROOT = Join-Path $env:USERPROFILE `
-  'OneDrive - Nerdio\MSP Sales Team - Sales Engineering - Sales Engineering\00 - Team Resources\Claude\Tools\se-command-center'
+# Known OneDrive sync path variants — different Nerdio accounts sync SharePoint
+# to different local folder names depending on their OneDrive configuration.
+$CANDIDATE_SHARED_ROOTS = @(
+  # Standard sync (most SEs): OneDrive - Nerdio
+  (Join-Path $env:USERPROFILE 'OneDrive - Nerdio\MSP Sales Team - Sales Engineering - Sales Engineering\00 - Team Resources\Claude\Tools\se-command-center'),
+  # Alternate sync (e.g. Marcos): Nerdio / Documents library
+  (Join-Path $env:USERPROFILE 'Nerdio\MSP Sales Team - Sales Engineering - Documents\Sales Engineering\00 - Team Resources\Claude\Tools\se-command-center')
+)
+$DEFAULT_SHARED_ROOT = $CANDIDATE_SHARED_ROOTS[0]
+
+# Personal root also varies by OneDrive folder name — try both.
+$CANDIDATE_PERSONAL_ROOTS = @(
+  (Join-Path $env:USERPROFILE 'OneDrive - Nerdio\SE-Command-Center'),
+  (Join-Path $env:USERPROFILE 'Nerdio\SE-Command-Center')
+)
+$PersonalRoot = $CANDIDATE_PERSONAL_ROOTS | Where-Object { Test-Path $_ } | Select-Object -First 1
+if (-not $PersonalRoot) { $PersonalRoot = $CANDIDATE_PERSONAL_ROOTS[0] }
 
 $ProdDir        = Join-Path $env:LOCALAPPDATA 'Programs\SE-Command-Center'
-$PersonalRoot   = Join-Path $env:USERPROFILE 'OneDrive - Nerdio\SE-Command-Center'
 $UserJson       = Join-Path $PersonalRoot 'user.json'
 $InstallConfig  = Join-Path $PersonalRoot 'install-config.json'
 
@@ -47,19 +61,22 @@ function Refresh-Path {
 }
 
 # Load $SharedRoot from install-config.json if the user previously set an
-# override, otherwise use the default OneDrive path. Returns $null if the
-# resolved path doesn't contain \app\ (caller then runs the sync UX).
+# override, otherwise probe the known candidate paths. Returns $null if none
+# have an app\ subfolder (caller then runs the sync UX).
 function Resolve-SharedRoot {
-  $root = $DEFAULT_SHARED_ROOT
+  # 1. Explicit override in install-config.json wins.
   if (Test-Path $InstallConfig) {
     try {
       $cfg = Get-Content $InstallConfig -Raw | ConvertFrom-Json
-      if ($cfg.shared_root -and (Test-Path $cfg.shared_root)) {
-        $root = $cfg.shared_root
+      if ($cfg.shared_root -and (Test-Path (Join-Path $cfg.shared_root 'app'))) {
+        return $cfg.shared_root
       }
     } catch {}
   }
-  if (Test-Path (Join-Path $root 'app')) { return $root }
+  # 2. Probe each known OneDrive path variant.
+  foreach ($candidate in $CANDIDATE_SHARED_ROOTS) {
+    if (Test-Path (Join-Path $candidate 'app')) { return $candidate }
+  }
   return $null
 }
 
@@ -69,7 +86,7 @@ function Save-SharedRootOverride {
     New-Item -ItemType Directory -Force -Path $PersonalRoot | Out-Null
   }
   $cfg = [ordered]@{ shared_root = $Path; saved_at = (Get-Date).ToString('o') }
-  ($cfg | ConvertTo-Json) | Set-Content -Path $InstallConfig -Encoding UTF8
+  [System.IO.File]::WriteAllText($InstallConfig, ($cfg | ConvertTo-Json), [System.Text.UTF8Encoding]::new($false))
   Write-Host "  Saved override to $InstallConfig" -ForegroundColor DarkGray
 }
 
@@ -323,6 +340,92 @@ if (-not (Test-Path $UserJson)) {
   Write-Host "  user.json: $UserJson (existing)" -ForegroundColor Green
 }
 
+# --- [4b/9] Seed personal profile stubs (voice-profile.md, background.md) ---
+# SE Command Center skills (se-email-reply, se-post-call-refine-email,
+# se-post-call-sf-update) read voice + background from the personal profile
+# folder. Seed empty templates so the SE has something to fill in — an empty
+# template is better than no file (skills silently fall back to generic tone).
+Write-Host ""
+Write-Host "  Seeding personal profile stubs..." -ForegroundColor Cyan
+$ProfileDir = Join-Path $PersonalRoot 'profile'
+if (-not (Test-Path $ProfileDir)) {
+  New-Item -ItemType Directory -Force -Path $ProfileDir | Out-Null
+}
+
+$voiceTemplate = @'
+# Voice Profile — <Your Name>
+
+The SE Command Center reads this file when drafting emails, SF notes, and
+follow-ups on your behalf. Fill it in so those outputs sound like you, not a
+generic template.
+
+## Tone
+<How do you write? Direct? Warm? Technical? A few sentences describing your default tone.>
+
+## Vocabulary
+<Words and phrases you use often. Words you avoid.>
+
+## Signature phrases
+<Openers, closers, or transitions you use consistently.>
+
+## Formatting habits
+<Bullets vs prose? Short paragraphs vs long? Emoji use?>
+
+## Examples
+Paste 2–3 short emails you actually sent and are happy with. These anchor the
+voice better than any description.
+'@
+
+$backgroundTemplate = @'
+# Background — <Your Name>
+
+Context about you, your role, and what you bring to customer conversations.
+Used by skills to inform how they frame technical content.
+
+## Role
+Sales Engineer at Nerdio. Primary domain: <AVD / M365 / both>.
+
+## Experience
+<What you did before Nerdio. Years in the industry. Relevant certifications.>
+
+## Territory / focus
+<Region, pod, product focus.>
+
+## Strengths
+<What you are especially good at. Topics where you go deep.>
+'@
+
+$profileFiles = @(
+  @{ Path = (Join-Path $ProfileDir 'voice-profile.md'); Content = $voiceTemplate      },
+  @{ Path = (Join-Path $ProfileDir 'background.md');    Content = $backgroundTemplate }
+)
+foreach ($f in $profileFiles) {
+  if (-not (Test-Path $f.Path)) {
+    [System.IO.File]::WriteAllText($f.Path, $f.Content, [System.Text.UTF8Encoding]::new($false))
+    Write-Host "    Seeded: $(Split-Path $f.Path -Leaf)" -ForegroundColor Green
+  } else {
+    Write-Host "    Exists: $(Split-Path $f.Path -Leaf)" -ForegroundColor DarkGray
+  }
+}
+Write-Host "  Personal profile: $ProfileDir" -ForegroundColor Green
+Write-Host "  Fill in the stubs so post-call emails and SF notes sound like you." -ForegroundColor DarkGray
+
+# --- [4c/9] Microsoft 365 MCP reminder ---
+# The dashboard's calendar, emails, meeting invites, and email drafting all flow
+# through the claude.ai-hosted Microsoft 365 integration. It's a one-time browser
+# OAuth per SE. Non-blocking — the installer just reminds the SE to do it.
+Write-Host ""
+Write-Host "  Microsoft 365 integration in claude.ai:" -ForegroundColor Cyan
+Write-Host "    The dashboard's calendar, emails, and Reply-in-Outlook flow all go through" -ForegroundColor DarkGray
+Write-Host "    the M365 integration on claude.ai. If you haven't enabled it yet:" -ForegroundColor DarkGray
+Write-Host ""
+Write-Host "      1. Open https://claude.ai/settings/integrations" -ForegroundColor Yellow
+Write-Host "      2. Find 'Microsoft 365' and click Enable / Connect" -ForegroundColor Yellow
+Write-Host "      3. Complete the browser OAuth prompt with your @getnerdio.com account" -ForegroundColor Yellow
+Write-Host ""
+Write-Host "    Non-blocking — dashboard installs fine either way, but data widgets will" -ForegroundColor DarkGray
+Write-Host "    stay empty until this integration is connected." -ForegroundColor DarkGray
+
 # --- [5/9] Create PROD install dir ---
 Write-Host ""
 Write-Host "[5/9] Creating PROD install dir..." -ForegroundColor Cyan
@@ -348,7 +451,11 @@ Write-Host ""
 Write-Host "[7/9] Running npm install..." -ForegroundColor Cyan
 Push-Location $ProdDir
 try {
-  npm install --silent 2>&1 | Out-Null
+  npm install --silent
+  if ($LASTEXITCODE -ne 0) {
+    Write-Host "  FATAL: npm install failed (exit $LASTEXITCODE)" -ForegroundColor Red
+    exit 8
+  }
 } finally { Pop-Location }
 Write-Host "  Done." -ForegroundColor Green
 
@@ -358,6 +465,10 @@ Write-Host "[8/9] Generating pod-roster.json..." -ForegroundColor Cyan
 Push-Location $ProdDir
 try {
   node scripts\setup.js
+  if ($LASTEXITCODE -ne 0) {
+    Write-Host "  FATAL: setup.js failed (see errors above). Fix user.json and re-run install.ps1." -ForegroundColor Red
+    exit 9
+  }
 } finally { Pop-Location }
 
 # --- [9/9] Register service or scheduled task ---
@@ -387,7 +498,7 @@ $cfgNew = [ordered]@{
   run_mode    = $runMode
   saved_at    = (Get-Date).ToString('o')
 }
-($cfgNew | ConvertTo-Json) | Set-Content -Path $InstallConfig -Encoding UTF8
+[System.IO.File]::WriteAllText($InstallConfig, ($cfgNew | ConvertTo-Json), [System.Text.UTF8Encoding]::new($false))
 
 Write-Host ""
 Write-Host "=== Install complete ===" -ForegroundColor Green
