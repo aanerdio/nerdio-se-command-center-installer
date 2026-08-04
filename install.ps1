@@ -166,10 +166,14 @@ function Install-WingetPackage {
 }
 
 function Prompt-CreateUserJson {
-  param([string]$UserJsonPath, [string]$PodAssignmentsPath, [string]$PersonalRootPath)
+  param([string]$UserJsonPath, [string]$PodAssignmentsPath, [string]$PersonalRootPath, [switch]$Reselect)
 
   Write-Host ""
-  Write-Host "  user.json missing — let's create it now." -ForegroundColor Yellow
+  if ($Reselect) {
+    Write-Host "  Let's pick the correct SE." -ForegroundColor Yellow
+  } else {
+    Write-Host "  user.json missing — let's create it now." -ForegroundColor Yellow
+  }
   Write-Host ""
 
   # Load the SE list from the shared pod-assignments.json.
@@ -437,7 +441,18 @@ Write-Host "[4/9] Verifying user.json..." -ForegroundColor Cyan
 if (-not (Test-Path $UserJson)) {
   Prompt-CreateUserJson -UserJsonPath $UserJson -PodAssignmentsPath $PodAssignments -PersonalRootPath $PersonalRoot
 } else {
-  Write-Host "  user.json: $UserJson (existing)" -ForegroundColor Green
+  $existing = Get-Content $UserJson -Raw | ConvertFrom-Json
+  Write-Host ""
+  Write-Host "  Found existing user.json:" -ForegroundColor Cyan
+  Write-Host "    Name:  $($existing.name)"
+  Write-Host "    Email: $($existing.email)"
+  Write-Host ""
+  $confirm = (Read-Host "  Is this correct? (Y/n)").Trim().ToLower()
+  if ($confirm -eq 'n' -or $confirm -eq 'no') {
+    Prompt-CreateUserJson -UserJsonPath $UserJson -PodAssignmentsPath $PodAssignments -PersonalRootPath $PersonalRoot -Reselect
+  } else {
+    Write-Host "  user.json confirmed." -ForegroundColor Green
+  }
 }
 
 # --- [4b/9] Seed personal profile stubs (voice-profile.md, background.md) ---
