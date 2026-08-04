@@ -1,7 +1,7 @@
 ﻿# install.ps1 — First-time SE Command Center install for a new SE.
 #
-# Download this file from the latest GitHub Release and run it from an
-# elevated PowerShell:
+# Download this file from the latest GitHub Release and run it from a normal
+# (non-elevated) PowerShell — no admin required:
 #
 #   $tmp = "$env:TEMP\install.ps1"
 #   Invoke-WebRequest -Uri 'https://github.com/aanerdio/nerdio-se-command-center-installer/releases/latest/download/install.ps1' -OutFile $tmp
@@ -29,8 +29,7 @@
 #   6. Robocopies the app code from shared\app\ into that folder.
 #   7. Runs npm install.
 #   8. Runs scripts\setup.js to generate config\pod-roster.json.
-#   9. Registers the NSSM Windows service (or Scheduled Task) pointing at
-#      the PROD install.
+#   9. Registers a per-user Scheduled Task that starts the dashboard at logon.
 #
 # Idempotent — safe to re-run. Won't clobber data\ or an existing user.json.
 # Won't overwrite already-populated profile files.
@@ -241,28 +240,55 @@ function Prompt-CreateUserJson {
 
 Write-Host "=== SE Command Center — first-time install ===" -ForegroundColor Cyan
 Write-Host ""
+Write-Host "  Dashboard will be registered as a per-user Scheduled Task (starts at your logon)." -ForegroundColor DarkGray
+Write-Host ""
 
-# --- Run mode selection ---
+# Admin detection is used for two things:
+#   1. Steering per-user vs machine-wide WinGet installs below.
+#   2. Removing a pre-cutover 'SE Dashboard' Windows service if one exists.
+# The Scheduled Task itself always runs as the current user with limited rights.
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 
-if ($isAdmin) {
-  Write-Host "  Running as Administrator." -ForegroundColor DarkGray
+# --- Legacy Windows service cleanup ---
+# Pre-cutover installs registered SE Dashboard as a NSSM Windows service. If
+# that service is still present, we must remove it before registering the
+# Scheduled Task — otherwise both will fight for port 3131 on next logon.
+$LegacyServiceName = 'SE Dashboard'
+$legacyService = Get-Service -Name $LegacyServiceName -ErrorAction SilentlyContinue
+if ($legacyService) {
+  Write-Host "  Detected legacy Windows service '$LegacyServiceName' from a previous install." -ForegroundColor Yellow
+  if (-not $isAdmin) {
+    Write-Host ""
+    Write-Host "  ERROR: removing the legacy service requires admin. This install needs to run" -ForegroundColor Red
+    Write-Host "  elevated ONCE so the service can be cleaned up. After that, future installs" -ForegroundColor Red
+    Write-Host "  and updates run unelevated." -ForegroundColor Red
+    Write-Host ""
+    Write-Host "  Right-click PowerShell -> Run as Administrator, then re-run install.ps1." -ForegroundColor DarkGray
+    exit 2
+  }
+  if ($legacyService.Status -eq 'Running') {
+    Write-Host "    Stopping service..." -ForegroundColor DarkGray
+    Stop-Service -Name $LegacyServiceName -Force
+    Start-Sleep -Seconds 2
+  }
+  # Prefer NSSM to remove (matches how it was registered); fall back to sc.exe.
+  $nssm = (Get-Command nssm.exe -ErrorAction SilentlyContinue).Source
+  if ($nssm) {
+    Write-Host "    Removing via NSSM..." -ForegroundColor DarkGray
+    & $nssm remove $LegacyServiceName confirm | Out-Null
+  } else {
+    Write-Host "    NSSM not on PATH — removing via sc.exe..." -ForegroundColor DarkGray
+    & sc.exe delete $LegacyServiceName | Out-Null
+  }
+  Start-Sleep -Seconds 1
+  # Verify removal — Windows keeps the service record until all handles close.
+  $stillThere = Get-Service -Name $LegacyServiceName -ErrorAction SilentlyContinue
+  if ($stillThere) {
+    Write-Host "  WARNING: service still present after removal — reboot and re-run installer." -ForegroundColor Yellow
+    exit 2
+  }
+  Write-Host "    Legacy service removed." -ForegroundColor Green
   Write-Host ""
-  Write-Host "  How should the dashboard run after install?" -ForegroundColor Cyan
-  Write-Host "    [1]  Windows Service (recommended) — auto-starts at boot, runs via NSSM"
-  Write-Host "    [2]  Scheduled Task (per-user) — starts at your logon, no system-wide service"
-  Write-Host ""
-  do {
-    $modeChoice = (Read-Host "  Choice (1/2, default=1)").Trim()
-  } until ($modeChoice -in '', '1', '2')
-  $runMode = if ($modeChoice -eq '2') { 'task' } else { 'service' }
-  Write-Host ""
-} else {
-  Write-Host "  No admin privileges detected." -ForegroundColor Yellow
-  Write-Host "  Dashboard will be installed as a Scheduled Task (starts at your logon)." -ForegroundColor DarkGray
-  Write-Host "  To use a Windows Service instead, re-run this installer as Administrator." -ForegroundColor DarkGray
-  Write-Host ""
-  $runMode = 'task'
 }
 
 # --- [1/9] Shared SharePoint folder ---
@@ -296,21 +322,36 @@ Write-Host "  Pinning OneDrive folders (Always keep on this device)..." -Foregro
 
 # Even with the pin in place, OneDrive materializes files asynchronously.
 # setup.js needs pod-assignments.json specifically — wait up to 60s for it.
-if (-not (Test-Path $PodAssignments)) {
+# Test-Path alone isn't enough: OneDrive creates a zero-byte placeholder the
+# moment sync starts, so we also verify the file has content AND parses as
+# JSON before proceeding. Otherwise ConvertFrom-Json downstream crashes with
+# "Unexpected end of JSON input" under ErrorActionPreference=Stop and the
+# user sees a raw exception instead of the clean error path below.
+function Test-PodAssignmentsReady {
+  param([string]$Path)
+  if (-not (Test-Path $Path)) { return $false }
+  try {
+    $item = Get-Item $Path -ErrorAction Stop
+    if ($item.Length -lt 10) { return $false }
+    $null = Get-Content $Path -Raw | ConvertFrom-Json -ErrorAction Stop
+    return $true
+  } catch { return $false }
+}
+if (-not (Test-PodAssignmentsReady $PodAssignments)) {
   Write-Host "  Waiting for OneDrive to sync knowledge\ subfolder (up to 60s)..." -ForegroundColor Yellow
   $deadline = (Get-Date).AddSeconds(60)
-  while (-not (Test-Path $PodAssignments) -and (Get-Date) -lt $deadline) {
+  while (-not (Test-PodAssignmentsReady $PodAssignments) -and (Get-Date) -lt $deadline) {
     Start-Sleep -Milliseconds 500
   }
 }
-if (-not (Test-Path $PodAssignments)) {
+if (-not (Test-PodAssignmentsReady $PodAssignments)) {
   Write-Host ""
-  Write-Host "  ERROR: pod-assignments.json is missing at:" -ForegroundColor Red
+  Write-Host "  ERROR: pod-assignments.json is missing or unreadable at:" -ForegroundColor Red
   Write-Host "    $PodAssignments" -ForegroundColor DarkGray
   Write-Host ""
-  Write-Host "  The 'app\' folder is synced but 'knowledge\' is not. This is usually" -ForegroundColor Yellow
-  Write-Host "  a OneDrive selective-sync issue — the installer pinned the folder to" -ForegroundColor Yellow
-  Write-Host "  force download but OneDrive didn't materialize it in time." -ForegroundColor Yellow
+  Write-Host "  The 'app\' folder is synced but 'knowledge\' has either not synced or" -ForegroundColor Yellow
+  Write-Host "  is still a zero-byte OneDrive placeholder. The installer pinned the" -ForegroundColor Yellow
+  Write-Host "  folder to force download but OneDrive didn't finish materializing in time." -ForegroundColor Yellow
   Write-Host ""
   Write-Host "  Fix (manual):" -ForegroundColor Cyan
   Write-Host "    1. In the Explorer window that just opened, right-click 'knowledge'" -ForegroundColor DarkGray
@@ -603,23 +644,18 @@ try {
   }
 } finally { Pop-Location }
 
-# --- [9/9] Register service or scheduled task ---
+# --- [9/9] Register scheduled task ---
 Write-Host ""
-if ($runMode -eq 'service') {
-  Write-Host "[9/9] Registering Windows service (NSSM)..." -ForegroundColor Cyan
-  Push-Location $ProdDir
-  try {
-    & (Join-Path $ProdDir 'service\install-service.ps1')
-  } finally { Pop-Location }
-} else {
-  Write-Host "[9/9] Registering Scheduled Task (per-user, at logon)..." -ForegroundColor Cyan
-  Push-Location $ProdDir
-  try {
-    & (Join-Path $ProdDir 'service\install-task.ps1')
-  } finally { Pop-Location }
-}
+Write-Host "[9/9] Registering Scheduled Task (per-user, at logon)..." -ForegroundColor Cyan
+Push-Location $ProdDir
+try {
+  & (Join-Path $ProdDir 'service\install-task.ps1')
+} finally { Pop-Location }
 
-# --- Persist run_mode to install-config.json ---
+# --- Persist install-config.json ---
+# run_mode stays in the file as 'task' — update.ps1 still reads it so any
+# legacy 'service' entries from pre-cutover installs can be detected and
+# migrated on the next update.
 $cfgExisting = $null
 if (Test-Path $InstallConfig) {
   try { $cfgExisting = Get-Content $InstallConfig -Raw | ConvertFrom-Json } catch {}
@@ -627,7 +663,7 @@ if (Test-Path $InstallConfig) {
 $savedSharedRoot = if ($cfgExisting -and $cfgExisting.shared_root) { $cfgExisting.shared_root } else { $SharedRoot }
 $cfgNew = [ordered]@{
   shared_root = $savedSharedRoot
-  run_mode    = $runMode
+  run_mode    = 'task'
   saved_at    = (Get-Date).ToString('o')
 }
 [System.IO.File]::WriteAllText($InstallConfig, ($cfgNew | ConvertTo-Json), [System.Text.UTF8Encoding]::new($false))
@@ -636,7 +672,7 @@ Write-Host ""
 Write-Host "=== Install complete ===" -ForegroundColor Green
 Write-Host "  PROD install: $ProdDir"
 Write-Host "  Dashboard:    http://localhost:3131"
-Write-Host "  Run mode:     $runMode"
+Write-Host "  Run mode:     Scheduled Task (at logon)"
 Write-Host ""
 
 # Profile personalization reminder — call it out prominently because empty or
@@ -656,11 +692,7 @@ if ($profileSeededAny) {
 }
 Write-Host ""
 
-if ($runMode -eq 'task') {
-  Write-Host "  The dashboard starts automatically at your next logon."
-  Write-Host "  To start it now:  Start-ScheduledTask 'SE Dashboard'"
-  Write-Host ""
-  Write-Host "For future updates, run:  .\update.ps1  from $ProdDir (no admin needed)."
-} else {
-  Write-Host "For future updates, run:  .\update.ps1  from $ProdDir (elevated)."
-}
+Write-Host "  The dashboard starts automatically at your next logon."
+Write-Host "  To start it now:  Start-ScheduledTask 'SE Dashboard'"
+Write-Host ""
+Write-Host "For future updates, run:  .\update.ps1  from $ProdDir (no admin needed)."
