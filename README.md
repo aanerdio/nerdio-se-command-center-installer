@@ -1,6 +1,6 @@
 # Nerdio SE Command Center
 
-Pod-wide Sales Engineering command center for the Nerdio MSP SE team. Runs locally as a Windows service on every SE's laptop. Pulls pipeline data from Salesforce CSV reports (curated by the pod leads) and layers on live calendar, email, and post-call context.
+Pod-wide Sales Engineering command center for the Nerdio MSP SE team. Runs locally on every SE's laptop as a per-user Scheduled Task that starts at logon — no admin needed. Pulls pipeline data from Salesforce CSV reports (curated by the pod leads) and layers on live calendar, email, and post-call context.
 
 - **Dashboard:** `http://localhost:3131`
 - **Docs:** [OVERVIEW.md](OVERVIEW.md) — features & workflow · [QUICK-REFERENCE.md](QUICK-REFERENCE.md) — one-page cheat sheet · [ARCHITECTURE.md](ARCHITECTURE.md) — technical reference
@@ -18,7 +18,7 @@ Six-tab dashboard that unifies your SE workday:
 - **Accounts** — per-account Q&A, brief history, technical notes
 - **Post-Call** — upload a transcript → get Salesforce technical notes + follow-up email
 - **Feedback** — log partner enhancement requests / bugs to the shared tracker
-- **Settings** — pod roster, refresh cadences, service status
+- **Settings** — pod roster, refresh cadences, task status
 
 All data lives locally in per-user OneDrive; team pipeline data comes from a shared SharePoint folder.
 
@@ -28,10 +28,10 @@ All data lives locally in per-user OneDrive; team pipeline data comes from a sha
 
 **Prerequisites:**
 - Windows 11
-- Elevated PowerShell
+- A normal (non-elevated) PowerShell — admin is only needed once if you're migrating from an older Windows-service install
 - **Microsoft 365 integration enabled in claude.ai** (see below — needed for calendar, emails, and meeting invites)
 
-Node.js, the Claude CLI, and NSSM are all installed automatically via WinGet by the installer. You do **not** need to sync SharePoint first — the installer will walk you through that if the shared tool folder isn't already on disk.
+Node.js and the Claude CLI are installed automatically via WinGet by the installer. You do **not** need to sync SharePoint first — the installer will walk you through that if the shared tool folder isn't already on disk.
 
 ### Enable the Microsoft 365 integration in claude.ai
 
@@ -46,7 +46,7 @@ That's it — the dashboard's calendar, emails, meeting invites, and email draft
 
 **No other MCPs required.** The dashboard does **not** need the local Outlook COM MCP, HubSpot MCP, or any Entra app registration.
 
-**Steps** (elevated PowerShell):
+**Steps** (normal PowerShell — no admin):
 
 ```powershell
 $tmp = "$env:TEMP\install.ps1"
@@ -55,13 +55,14 @@ powershell -ExecutionPolicy Bypass -File $tmp
 ```
 
 The installer:
-1. Locates the shared SharePoint tool folder — if it's missing, offers to open the SP site in your browser (click **Sync**) or accept a custom local path.
-2. Installs Node.js LTS and Claude Code via WinGet if not already present.
-3. Shows a numbered menu of SEs (from the shared `pod-assignments.json`) — pick yours to confirm identity.
-4. Writes `%USERPROFILE%\OneDrive - Nerdio\SE-Command-Center\user.json`.
-5. Copies the app into `%LOCALAPPDATA%\Programs\SE-Command-Center\`.
-6. Runs `npm install` and generates your `pod-roster.json`.
-7. Registers the **SE Dashboard** NSSM Windows service and starts it.
+1. Detects any legacy `SE Dashboard` Windows service from an older install and removes it (this one step needs admin — the installer will tell you to re-run elevated if it finds one).
+2. Locates the shared SharePoint tool folder — if it's missing, offers to open the SP site in your browser (click **Sync**) or accept a custom local path.
+3. Installs Node.js LTS and Claude Code via WinGet if not already present.
+4. Shows a numbered menu of SEs (from the shared `pod-assignments.json`) — pick yours to confirm identity.
+5. Writes `%USERPROFILE%\OneDrive - Nerdio\SE-Command-Center\user.json`.
+6. Copies the app into `%LOCALAPPDATA%\Programs\SE-Command-Center\`.
+7. Runs `npm install` and generates your `pod-roster.json`.
+8. Registers the **SE Dashboard** per-user Scheduled Task (triggered at your logon, battery-safe) and starts it.
 
 Idempotent — safe to re-run.
 
@@ -71,7 +72,7 @@ Open the dashboard at **http://localhost:3131**.
 
 ## Update to the latest version
 
-When Anthony or Marcos publishes a new release, run one of these from an elevated PowerShell:
+When Anthony or Marcos publishes a new release, run one of these from a normal (non-elevated) PowerShell:
 
 ```powershell
 # A) From your PROD install directory (normal case):
@@ -86,22 +87,24 @@ Invoke-WebRequest -Uri 'https://github.com/aanerdio/nerdio-se-command-center-ins
 powershell -ExecutionPolicy Bypass -File $tmp
 ```
 
-The script compares `version.json`, mirrors the shared code into your PROD install, runs `npm install` only if `package.json` changed, and restarts the service. Safe to re-run.
+The script compares `version.json`, mirrors the shared code into your PROD install, runs `npm install` only if `package.json` changed, and restarts the Scheduled Task. Safe to re-run.
 
 Use `.\update.ps1 -Force` to sync even when versions match.
 
+**One-time migration:** if your machine was installed before the switch to Scheduled Task (i.e. still has an `SE Dashboard` Windows service), the *first* `update.ps1` after cutover has to run elevated so it can remove the old service and register the new task. Every update after that runs unelevated.
+
 ---
 
-## Service management
+## Task management
 
 ```powershell
-Get-Service 'SE Dashboard'                 # status
-Restart-Service 'SE Dashboard'
-Stop-Service 'SE Dashboard'
-Start-Service 'SE Dashboard'
+Get-ScheduledTask   -TaskName 'SE Dashboard' | Get-ScheduledTaskInfo   # status
+Start-ScheduledTask -TaskName 'SE Dashboard'
+Stop-ScheduledTask  -TaskName 'SE Dashboard'
+.\service\status.ps1                                                   # full health check
 ```
 
-Logs: `%LOCALAPPDATA%\Programs\SE-Command-Center\service\logs\dashboard.log` (NSSM-rotated at 5 MB).
+Logs: `%LOCALAPPDATA%\Programs\SE-Command-Center\service\logs\dashboard.log` (rotates at 5 MB, 5 archives kept).
 
 ---
 
@@ -121,11 +124,11 @@ Only Anthony + Marcos can write to the shared pipeline store — everyone else's
 
 | Symptom | Fix |
 |---|---|
-| `localhost:3131` won't load | `Get-Service 'SE Dashboard'` — if not Running, `Restart-Service 'SE Dashboard'` |
+| `localhost:3131` won't load | `Get-ScheduledTask 'SE Dashboard'` — if State is not Running/Ready, `Start-ScheduledTask 'SE Dashboard'`. Or run `.\service\status.ps1` for a full picture. |
 | Pipeline tab empty | The shared store may be stale. Ask Anthony or Marcos to run `/se-sf-sync`, or wait for the 8:30 AM auto-refresh. |
-| Dashboard shows the wrong SE | Edit `$env:USERPROFILE\OneDrive - Nerdio\SE-Command-Center\user.json` and restart the service. |
+| Dashboard shows the wrong SE | Edit `$env:USERPROFILE\OneDrive - Nerdio\SE-Command-Center\user.json`, then `Stop-ScheduledTask 'SE Dashboard'; Start-ScheduledTask 'SE Dashboard'`. |
 | "user.json missing" on startup | Re-run `.\install.ps1` from your PROD install dir — it'll prompt for your SE identity. |
-| Service won't start after update | Check `service\logs\dashboard.log`; verify Node.js is on PATH for the service account. |
+| Task won't start after update | Check `service\logs\dashboard.log`; verify `node` is on your user PATH. |
 | `sf-pipeline-store.json not found` | The shared SharePoint folder isn't synced. Confirm `%USERPROFILE%\OneDrive - Nerdio\MSP Sales Team - Sales Engineering - Sales Engineering\00 - Team Resources\Claude\Tools\se-command-center\data\` exists and contains the file. |
 | Skill stuck / spinner won't clear | POST to `/api/cancel-processing` or delete `data\processing.json` under your personal `SE-Command-Center\`. Check `logs\skill-*.log`. |
 | Meeting Prep says "skipped" | The skill decided the meeting isn't SE work — internal Nerdio meeting, no SF opp, wrong stage (still Discovery), or the opp is already closed. Reason line explains why. Click **Run Anyway** if you want to force full prep. |
