@@ -152,7 +152,8 @@ function Install-WingetPackage {
     & winget install --id $PackageId -e --silent --scope user --accept-source-agreements --accept-package-agreements 2>&1 | Out-Null
     $ok = ($LASTEXITCODE -eq 0) -or ($LASTEXITCODE -eq -1978335189)
     if ($ok) { Refresh-Path; return $true }
-    Write-Host "  Per-user scope failed (exit $LASTEXITCODE) — trying machine-wide install..." -ForegroundColor DarkGray
+    Write-Host "  WinGet user-scope install failed (exit $LASTEXITCODE)." -ForegroundColor Yellow
+    return $false
   }
 
   Write-Host "  Installing $FriendlyName via WinGet ($PackageId)..." -ForegroundColor DarkGray
