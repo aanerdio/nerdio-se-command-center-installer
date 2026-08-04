@@ -200,7 +200,7 @@ function Prompt-CreateUserJson {
 
   # Prompt for a valid number
   do {
-    $raw = (Read-Host "  Enter number (1-$($pods.Count))").Trim()
+    $raw = ([string](Read-Host "  Enter number (1-$($pods.Count))")).Trim()
     $n = 0
     $ok = [int]::TryParse($raw, [ref]$n) -and $n -ge 1 -and $n -le $pods.Count
     if (-not $ok) { Write-Host "  '$raw' isn't a valid choice. Enter a number between 1 and $($pods.Count)." -ForegroundColor Red }
@@ -216,7 +216,7 @@ function Prompt-CreateUserJson {
   Write-Host "    Name:  $name"
   Write-Host "    Email: $email"
   Write-Host ""
-  $confirm = (Read-Host '  Proceed? (Y/n)').Trim().ToLower()
+  $confirm = ([string](Read-Host '  Proceed? (Y/n)')).Trim().ToLower()
   if ($confirm -eq 'n' -or $confirm -eq 'no') {
     Write-Host "  Aborted. Re-run install.ps1 to try again." -ForegroundColor Yellow
     exit 7
@@ -447,7 +447,7 @@ if (-not (Test-Path $UserJson)) {
   Write-Host "    Name:  $($existing.name)"
   Write-Host "    Email: $($existing.email)"
   Write-Host ""
-  $confirm = (Read-Host "  Is this correct? (Y/n)").Trim().ToLower()
+  $confirm = ([string](Read-Host "  Is this correct? (Y/n)")).Trim().ToLower()
   if ($confirm -eq 'n' -or $confirm -eq 'no') {
     Prompt-CreateUserJson -UserJsonPath $UserJson -PodAssignmentsPath $PodAssignments -PersonalRootPath $PersonalRoot -Reselect
   } else {
