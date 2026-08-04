@@ -650,6 +650,10 @@ Write-Host "[9/9] Registering Scheduled Task (per-user, at logon)..." -Foregroun
 Push-Location $ProdDir
 try {
   & (Join-Path $ProdDir 'service\install-task.ps1')
+  if ($LASTEXITCODE -ne 0) {
+    Write-Host "  FATAL: Scheduled Task registration failed (exit $LASTEXITCODE)." -ForegroundColor Red
+    exit 11
+  }
 } finally { Pop-Location }
 
 # --- Persist install-config.json ---
@@ -692,7 +696,9 @@ if ($profileSeededAny) {
 }
 Write-Host ""
 
-Write-Host "  The dashboard starts automatically at your next logon."
-Write-Host "  To start it now:  Start-ScheduledTask 'SE Dashboard'"
+Write-Host "  Dashboard is starting — http://localhost:3131 will be ready in a moment."
+Write-Host "  It will also start automatically at every logon."
+Write-Host ""
+Write-Host "  To restart manually:  Start-ScheduledTask 'SE Dashboard'"
 Write-Host ""
 Write-Host "For future updates, run:  .\update.ps1  from $ProdDir (no admin needed)."
