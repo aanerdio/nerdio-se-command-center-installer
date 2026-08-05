@@ -182,6 +182,43 @@ if ($LASTEXITCODE -ge 8) {
 }
 Copy-Item -Path $SharedVer -Destination $LocalVer -Force
 
+# --- Sync managed skills into ~/.claude/skills/ ---
+# The DEV repo's skills/ folder is the source of truth for skills that ship
+# with the dashboard (e.g. se-refresh-calendar, se-meeting-prep). Mirror each
+# managed skill dir into the user's ~/.claude/skills/ so Claude Code finds
+# them where it expects. We mirror per-skill (not the parent) so any personal
+# skills the user has at ~/.claude/skills/ outside our managed set stay put.
+#
+# Skip if the target is a junction/symlink — that's Anthony's DEV setup where
+# ~/.claude/skills/<skill> is linked back to the DEV repo. Overwriting would
+# clobber DEV edits with the older PROD copy.
+$SkillsSrc = Join-Path $RepoRoot 'skills'
+$UserSkillsDst = Join-Path $env:USERPROFILE '.claude\skills'
+if (Test-Path $SkillsSrc) {
+  if (-not (Test-Path $UserSkillsDst)) {
+    New-Item -ItemType Directory -Path $UserSkillsDst -Force | Out-Null
+  }
+  $syncedCount = 0
+  $skippedCount = 0
+  foreach ($skillDir in Get-ChildItem $SkillsSrc -Directory) {
+    $dst = Join-Path $UserSkillsDst $skillDir.Name
+    if ((Test-Path $dst) -and ((Get-Item $dst -Force).Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+      Write-Host "  Skipping skill $($skillDir.Name) — junction to DEV workspace." -ForegroundColor DarkGray
+      $skippedCount++
+      continue
+    }
+    robocopy $skillDir.FullName $dst /MIR /NFL /NDL /NP /R:2 /W:1 | Out-Null
+    if ($LASTEXITCODE -ge 8) {
+      Write-Host "  WARN: skill sync of $($skillDir.Name) returned $LASTEXITCODE" -ForegroundColor Yellow
+    } else {
+      $syncedCount++
+    }
+  }
+  if ($syncedCount -gt 0 -or $skippedCount -gt 0) {
+    Write-Host "  Skills: $syncedCount synced, $skippedCount skipped (junctions) -> $UserSkillsDst" -ForegroundColor Green
+  }
+}
+
 # --- Re-install dependencies if package.json changed ---
 $newPkgHash = (Get-FileHash (Join-Path $RepoRoot 'package.json') -Algorithm SHA256).Hash
 if ($localPkgHash -ne $newPkgHash) {
