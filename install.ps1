@@ -28,7 +28,7 @@
 #   5. Creates the per-user PROD install at %LOCALAPPDATA%\Programs\SE-Command-Center\.
 #   6. Robocopies the app code from shared\app\ into that folder.
 #   7. Runs npm install.
-#   8. Runs scripts\setup.js to generate config\pod-roster.json.
+#   8. Runs scripts\setup.js to validate that a roster can be derived.
 #   9. Registers a per-user Scheduled Task that starts the dashboard at logon.
 #
 # Idempotent — safe to re-run. Won't clobber data\ or an existing user.json.
@@ -549,7 +549,6 @@ clear technical need. Primary responsibilities:
 - Technical demos (AVD, M365)
 - Proof of Value engagements (structured validation)
 - Objection handling (Citrix, native Azure, "why Nerdio")
-- Clean technical handoff to the Go-Live Engineering (GLE) team at close
 
 I own **technical validation, not commercials.** MSP pricing, discounts, and
 licensing volume conversations go to the PSM. The only price I quote directly
@@ -650,7 +649,7 @@ Write-Host "  Done." -ForegroundColor Green
 
 # --- [8/9] setup.js ---
 Write-Host ""
-Write-Host "[8/9] Generating pod-roster.json..." -ForegroundColor Cyan
+Write-Host "[8/9] Validating roster derivation..." -ForegroundColor Cyan
 Push-Location $ProdDir
 try {
   node scripts\setup.js
