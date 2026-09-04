@@ -61,7 +61,7 @@ The installer:
 4. Shows a numbered menu of SEs (from the shared `pod-assignments.json`) — pick yours to confirm identity.
 5. Writes `%USERPROFILE%\OneDrive - Nerdio\SE-Command-Center\user.json`.
 6. Copies the app into `%LOCALAPPDATA%\Programs\SE-Command-Center\`.
-7. Runs `npm install` and generates your `pod-roster.json`.
+7. Runs `npm install` and verifies your roster can be derived from the shared pod assignments.
 8. Registers the **SE Dashboard** per-user Scheduled Task (triggered at your logon, battery-safe) and starts it.
 
 Idempotent — safe to re-run.
@@ -125,7 +125,7 @@ Only Anthony + Marcos can write to the shared pipeline store — everyone else's
 | Symptom | Fix |
 |---|---|
 | `localhost:3131` won't load | `Get-ScheduledTask 'SE Dashboard'` — if State is not Running/Ready, `Start-ScheduledTask 'SE Dashboard'`. Or run `.\service\status.ps1` for a full picture. |
-| Pipeline tab empty | The shared store may be stale. Ask Anthony or Marcos to run `/se-sf-sync`, or wait for the 8:30 AM auto-refresh. |
+| Pipeline tab empty | The shared store may be stale. Ask Anthony or Marcos to click **Sync Pipeline** on the Opportunities tab, or wait for the 8:30 AM auto-refresh. |
 | Dashboard shows the wrong SE | Edit `$env:USERPROFILE\OneDrive - Nerdio\SE-Command-Center\user.json`, then `Stop-ScheduledTask 'SE Dashboard'; Start-ScheduledTask 'SE Dashboard'`. |
 | "user.json missing" on startup | Re-run `.\install.ps1` from your PROD install dir — it'll prompt for your SE identity. |
 | Task won't start after update | Check `service\logs\dashboard.log`; verify `node` is on your user PATH. |
