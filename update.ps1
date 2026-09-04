@@ -64,7 +64,6 @@ if (-not $SharedRoot) {
 $SharedApp  = Join-Path $SharedRoot 'app'
 $SharedVer  = Join-Path $SharedApp 'version.json'
 $LocalVer   = Join-Path $RepoRoot 'version.json'
-$SharedPod  = Join-Path $SharedRoot 'knowledge\domain\pod-assignments.json'
 
 # DEV safety guard: refuse to overwrite the git-tracked DEV workspace.
 # Anthony/Marcos use publish.ps1 from DEV → then update.ps1 from PROD.
@@ -149,15 +148,17 @@ if (-not $Force -and $sharedVersion -eq $localVersion) {
 $localPkgHash  = if (Test-Path (Join-Path $RepoRoot 'package.json')) {
   (Get-FileHash (Join-Path $RepoRoot 'package.json') -Algorithm SHA256).Hash
 } else { '' }
-# Read the hash stored inside the snapshot JSON (matches services/pod-refresh.js format:
-# { hash, checked_at, source }). If missing or unparseable, treat as changed.
-$snapshotPath = Join-Path $RepoRoot 'config\pod-assignments.snapshot.json'
-$localPodHash = if (Test-Path $snapshotPath) {
-  try { ((Get-Content $snapshotPath -Raw | ConvertFrom-Json).hash).ToLower() } catch { '' }
-} else { '' }
-$sharedPodHash = if (Test-Path $SharedPod) {
-  (Get-FileHash $SharedPod -Algorithm SHA256).Hash.ToLower()
-} else { '' }
+# The pod-assignments snapshot hash used to live here. It compared the shared
+# pod-assignments.json against config\pod-assignments.snapshot.json to decide
+# whether to regenerate config\pod-roster.json. Both files are gone: roster.js
+# derives the roster in memory from the shared file on every read, memoized on
+# mtime, so there is nothing to regenerate and nothing to keep in sync. The
+# snapshot's own format comment pointed at services\pod-refresh.js, which was
+# deleted in the same change.
+#
+# The check was also nearly always meaningless: pod-assignments.json reaches
+# every SE continuously through OneDrive, not through update.ps1, so by the time
+# an update ran the "change" had usually been live for days.
 
 # --- Stop scheduled task ---
 $wasRunning = $false
@@ -173,7 +174,7 @@ if ($task -and $task.State -eq 'Running') {
 Write-Host "Syncing from $SharedApp..." -ForegroundColor Cyan
 $rc = robocopy $SharedApp $RepoRoot /MIR `
   /XD node_modules data logs .git .vscode `
-  /XF pod-roster.json pod-assignments.snapshot.json version.json `
+  /XF version.json `
   /NFL /NDL /NP /R:2 /W:1
 if ($LASTEXITCODE -ge 8) {
   Write-Host "FATAL: robocopy failed with exit code $LASTEXITCODE" -ForegroundColor Red
@@ -182,40 +183,45 @@ if ($LASTEXITCODE -ge 8) {
 }
 Copy-Item -Path $SharedVer -Destination $LocalVer -Force
 
-# --- Sync managed skills into ~/.claude/skills/ ---
-# The DEV repo's skills/ folder is the source of truth for skills that ship
-# with the dashboard (e.g. se-refresh-calendar, se-meeting-prep). Mirror each
-# managed skill dir into the user's ~/.claude/skills/ so Claude Code finds
-# them where it expects. We mirror per-skill (not the parent) so any personal
-# skills the user has at ~/.claude/skills/ outside our managed set stay put.
+# --- Retire per-user copies of the managed skills ---
+# This used to MIRROR every skill from <ProdDir>\skills into ~\.claude\skills.
+# It now does the opposite: it removes them.
 #
-# Skip if the target is a junction/symlink — that's Anthony's DEV setup where
-# ~/.claude/skills/<skill> is linked back to the DEV repo. Overwriting would
-# clobber DEV edits with the older PROD copy.
-$SkillsSrc = Join-Path $RepoRoot 'skills'
+# Skills no longer ship inside app\. publish.ps1 sends them to
+# <SHARED_ROOT>\.claude\skills, which is the PROJECT SCOPE a PROD skill run
+# already resolves against -- server.js spawns claude.exe with cwd = SHARED_ROOT.
+# So all 12 are reachable with no local copy at all, and a local copy is actively
+# harmful: two copies resolve under one skill name and which one wins is not
+# predictable. That is how the shared folder sat two months stale while the
+# current versions lived somewhere else.
+#
+# ~\.claude\skills stays as the home for an SE's own /slash-command skills. Those
+# are personal and this never touches them -- only names that appear in the
+# published set are removed.
+#
+# A junction is the DEV setup (~\.claude\skills\<skill> linked back to the repo)
+# and is left alone.
+$SkillsSrc = Join-Path $SharedRoot '.claude\skills'
 $UserSkillsDst = Join-Path $env:USERPROFILE '.claude\skills'
-if (Test-Path $SkillsSrc) {
-  if (-not (Test-Path $UserSkillsDst)) {
-    New-Item -ItemType Directory -Path $UserSkillsDst -Force | Out-Null
-  }
-  $syncedCount = 0
-  $skippedCount = 0
-  foreach ($skillDir in Get-ChildItem $SkillsSrc -Directory) {
-    $dst = Join-Path $UserSkillsDst $skillDir.Name
-    if ((Test-Path $dst) -and ((Get-Item $dst -Force).Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
-      Write-Host "  Skipping skill $($skillDir.Name) — junction to DEV workspace." -ForegroundColor DarkGray
-      $skippedCount++
+if ((Test-Path $SkillsSrc) -and (Test-Path $UserSkillsDst)) {
+  $retired = 0
+  $skipped = 0
+  foreach ($name in (Get-ChildItem $SkillsSrc -Directory).Name) {
+    $dst = Join-Path $UserSkillsDst $name
+    if (-not (Test-Path $dst)) { continue }
+    if ((Get-Item $dst -Force).Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+      Write-Host "  Skipping $name — junction to DEV workspace." -ForegroundColor DarkGray
+      $skipped++
       continue
     }
-    robocopy $skillDir.FullName $dst /MIR /NFL /NDL /NP /R:2 /W:1 | Out-Null
-    if ($LASTEXITCODE -ge 8) {
-      Write-Host "  WARN: skill sync of $($skillDir.Name) returned $LASTEXITCODE" -ForegroundColor Yellow
-    } else {
-      $syncedCount++
-    }
+    Remove-Item $dst -Recurse -Force
+    $retired++
   }
-  if ($syncedCount -gt 0 -or $skippedCount -gt 0) {
-    Write-Host "  Skills: $syncedCount synced, $skippedCount skipped (junctions) -> $UserSkillsDst" -ForegroundColor Green
+  if ($retired -gt 0) {
+    Write-Host "  Removed $retired duplicate skill copies from ~\.claude\skills — they are served from the shared folder now." -ForegroundColor DarkGray
+  }
+  if ($skipped -gt 0) {
+    Write-Host "  Skills: $skipped skipped (DEV junctions)." -ForegroundColor DarkGray
   }
 }
 
@@ -235,21 +241,30 @@ if ($localPkgHash -ne $newPkgHash) {
   } finally { Pop-Location }
 }
 
-# --- Re-run setup.js if pod-assignments changed ---
-if ($sharedPodHash -ne $localPodHash) {
-  Write-Host "  pod-assignments changed — regenerating pod-roster.json..." -ForegroundColor Cyan
-  Push-Location $RepoRoot
-  try {
-    node scripts\setup.js
-    # Write snapshot in the {hash, checked_at, source} format shared with services/pod-refresh.js
-    $snapshotJson = @{
-      hash       = $sharedPodHash
-      checked_at = (Get-Date).ToString('o')
-      source     = $SharedPod
-    } | ConvertTo-Json
-    [System.IO.File]::WriteAllText($snapshotPath, $snapshotJson, [System.Text.UTF8Encoding]::new($false))
-  } finally { Pop-Location }
-}
+# --- Health check: can this machine still derive a roster? ---
+# This block used to be "regenerate pod-roster.json if the pod-assignments hash
+# changed". There is nothing to regenerate any more, but setup.js is still worth
+# running: it calls deriveRoster() and fails loudly on a missing user.json, an
+# unsynced SharePoint folder, or an SE with no pod assignment -- each of which
+# otherwise surfaces much later as an empty dashboard with no obvious cause.
+#
+# Run unconditionally rather than on a hash, since the old trigger keyed on a file
+# that reaches every SE through OneDrive rather than through update.ps1.
+#
+# A WARNING here, not a failure. install.ps1 treats the same check as fatal, which
+# is right at install time; on an update it usually means OneDrive has not finished
+# syncing yet, and blocking an otherwise-good update on that helps nobody.
+Write-Host ""
+Write-Host "Verifying roster derivation..." -ForegroundColor Cyan
+Push-Location $RepoRoot
+try {
+  node scripts\setup.js
+  if ($LASTEXITCODE -ne 0) {
+    Write-Host "  WARN: the roster could not be derived on this machine." -ForegroundColor Yellow
+    Write-Host "  The update itself succeeded. Usually this means the shared SharePoint" -ForegroundColor DarkGray
+    Write-Host "  folder is still syncing -- re-run 'npm run setup' once it has." -ForegroundColor DarkGray
+  }
+} finally { Pop-Location }
 
 # --- Restart scheduled task ---
 $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
