@@ -139,7 +139,26 @@ $localVersion  = if (Test-Path $LocalVer) {
 Write-Host "  Local:  $localVersion"
 Write-Host "  Shared: $sharedVersion"
 
-if (-not $Force -and $sharedVersion -eq $localVersion) {
+# An update is more than the version stamp: robocopy, npm install, the skill
+# retire pass, and the task restart all follow it. Interrupt the run after the
+# stamp -- Ctrl-C, a reboot, OneDrive yanking a file mid-copy -- and the local
+# version already reads as the new one while the install is half-migrated. The
+# next run then compared equal versions, printed "Already up to date" and exited
+# 0, which is indistinguishable from a healthy install and is how a broken PROD
+# went unnoticed from 21 Aug to 4 Sep.
+#
+# The marker is written BEFORE the stamp and cleared only after the dashboard has
+# been observed serving. So its presence means "the last attempt did not finish",
+# and that forces a full re-run regardless of what the versions say.
+$Marker = Join-Path $RepoRoot '.update-in-progress'
+$resuming = Test-Path $Marker
+if ($resuming) {
+  $mv = ''
+  try { $mv = (Get-Content $Marker -Raw | ConvertFrom-Json).target_version } catch {}
+  Write-Host "  A previous update did not complete$(if ($mv) { " (target $mv)" }) — re-running it." -ForegroundColor Yellow
+}
+
+if (-not $Force -and -not $resuming -and $sharedVersion -eq $localVersion) {
   Write-Host "Already up to date." -ForegroundColor Green
   exit 0
 }
@@ -170,11 +189,28 @@ if ($task -and $task.State -eq 'Running') {
   Start-Sleep -Seconds 2
 }
 
+# --- Mark the update as in flight ---
+# Written before the first destructive step. See the $Marker comment above.
+try {
+  $markerBody = [ordered]@{
+    target_version = $sharedVersion
+    from_version   = $localVersion
+    started_at     = (Get-Date).ToString('o')
+    host           = $env:COMPUTERNAME
+  } | ConvertTo-Json
+  [System.IO.File]::WriteAllText($Marker, $markerBody, [System.Text.UTF8Encoding]::new($false))
+} catch {
+  Write-Host "  WARN: could not write $Marker — a partial update will not be detected." -ForegroundColor Yellow
+}
+
 # --- Sync from shared ---
+# .update-in-progress is in /XF for the same reason version.json is: under /MIR,
+# a file present in the destination but not the source is DELETED. Excluding it
+# blocks the delete as well as the copy, so the marker survives its own sync.
 Write-Host "Syncing from $SharedApp..." -ForegroundColor Cyan
 $rc = robocopy $SharedApp $RepoRoot /MIR `
   /XD node_modules data logs .git .vscode `
-  /XF version.json `
+  /XF version.json .update-in-progress `
   /NFL /NDL /NP /R:2 /W:1
 if ($LASTEXITCODE -ge 8) {
   Write-Host "FATAL: robocopy failed with exit code $LASTEXITCODE" -ForegroundColor Red
@@ -267,6 +303,7 @@ try {
 } finally { Pop-Location }
 
 # --- Restart scheduled task ---
+$taskStarted = $false
 $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
 if ($task) {
   Write-Host "  Starting scheduled task..." -ForegroundColor Cyan
@@ -274,8 +311,60 @@ if ($task) {
   Start-Sleep -Seconds 2
   $task = Get-ScheduledTask -TaskName $TaskName
   Write-Host "  Task state: $($task.State)" -ForegroundColor Green
+  $taskStarted = $true
 } else {
   Write-Host "  Scheduled task not installed. Run .\service\install-task.ps1 to register it." -ForegroundColor Yellow
+}
+
+# --- Confirm the dashboard is actually serving the new version ---
+# Starting the task proves only that Task Scheduler accepted the request. It does
+# not prove node started, that anything bound 3131, or that the code now serving
+# is the code we just copied. Without this the script ended on an optimistic
+# "Updated to X" whether or not X was running -- so a failed update looked exactly
+# like a successful one.
+#
+# Failure here is a WARNING, not an exit code: the files on disk are correct and
+# re-running would not help. But the marker is deliberately LEFT IN PLACE so the
+# next run repeats the update rather than short-circuiting on matching versions.
+$serving = $null
+$healthy = $false
+if ($taskStarted) {
+  Write-Host ""
+  Write-Host "Waiting for the dashboard to answer on 3131..." -ForegroundColor Cyan
+  $deadline = (Get-Date).AddSeconds(45)
+  while ((Get-Date) -lt $deadline) {
+    try {
+      $d = Invoke-RestMethod -Uri 'http://localhost:3131/api/diagnostics' -TimeoutSec 3 -ErrorAction Stop
+      $serving = $d.version.version
+      $healthy = $true
+      break
+    } catch {
+      # Not listening yet. node takes a few seconds, and on a cold OneDrive the
+      # first roster read can take longer.
+      Start-Sleep -Seconds 2
+    }
+  }
+}
+
+if ($healthy) {
+  if ($serving -eq $sharedVersion) {
+    Write-Host "  Serving $serving — confirmed." -ForegroundColor Green
+    try { Remove-Item $Marker -Force -ErrorAction Stop } catch {}
+  } else {
+    # Files updated but the running process reports something else. Usually the
+    # old process never exited and is still holding the port.
+    Write-Host "  WARN: the dashboard answered but reports version '$serving', not '$sharedVersion'." -ForegroundColor Yellow
+    Write-Host "  An older process is probably still holding port 3131. Check with:" -ForegroundColor DarkGray
+    Write-Host "    Get-Process node | Select-Object Id,StartTime" -ForegroundColor DarkGray
+    Write-Host "  The update will be re-run next time until this resolves." -ForegroundColor DarkGray
+  }
+} elseif ($taskStarted) {
+  Write-Host "  WARN: nothing answered on http://localhost:3131 within 45s." -ForegroundColor Yellow
+  Write-Host "  The files were updated, but the dashboard is not serving them." -ForegroundColor DarkGray
+  Write-Host "  Check the task and the log:" -ForegroundColor DarkGray
+  Write-Host "    Get-ScheduledTask -TaskName '$TaskName' | Select-Object State" -ForegroundColor DarkGray
+  Write-Host "    Get-Content '$RepoRoot\logs\server.log' -Tail 30" -ForegroundColor DarkGray
+  Write-Host "  The update will be re-run next time until this resolves." -ForegroundColor DarkGray
 }
 
 # --- Rewrite install-config.json so run_mode is 'task' post-migration ---
@@ -290,6 +379,21 @@ if ($legacyRunMode -ne 'task') {
   } catch {}
 }
 
+if (-not $taskStarted) {
+  # Nothing to health-check against. The file sync is complete and the missing
+  # task is reported loudly above, so don't leave the marker to force a pointless
+  # re-sync on every future run.
+  try { Remove-Item $Marker -Force -ErrorAction Stop } catch {}
+}
+
 Write-Host ''
-Write-Host "Updated to $sharedVersion." -ForegroundColor Green
+if ($healthy -and $serving -eq $sharedVersion) {
+  Write-Host "Updated to $sharedVersion and confirmed serving." -ForegroundColor Green
+} elseif ($taskStarted) {
+  # Say what is actually true. The old unconditional "Updated to X" was the line
+  # that made a dead dashboard read as a successful update.
+  Write-Host "Files updated to $sharedVersion, but the dashboard was NOT confirmed serving." -ForegroundColor Yellow
+} else {
+  Write-Host "Files updated to $sharedVersion. Register the scheduled task to run it." -ForegroundColor Yellow
+}
 Write-Host "Dashboard: http://localhost:3131"
