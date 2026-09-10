@@ -179,15 +179,61 @@ $localPkgHash  = if (Test-Path (Join-Path $RepoRoot 'package.json')) {
 # every SE continuously through OneDrive, not through update.ps1, so by the time
 # an update ran the "change" had usually been live for days.
 
-# --- Stop scheduled task ---
+# --- Stop the running dashboard ---
+# Stopping the TASK is not the same as stopping the SERVER, and conflating them is
+# why PROD could run two-day-old code through repeated "successful" updates.
+#
+# The task launches service\start-dashboard.ps1 under pwsh, which runs node as a
+# child. Stop-ScheduledTask kills pwsh but can leave the node grandchild alive and
+# still bound to 3131. The task then reports 'Ready' while the old server keeps
+# serving, so:
+#   - the next update's `if ($task.State -eq 'Running')` is FALSE and never even
+#     tries to stop anything, and
+#   - Start-ScheduledTask launches start-dashboard.ps1, which is a singleton: it
+#     sees 3131 already in use, logs "refusing to start a duplicate" and exits 0.
+# Files update, the task reports success, and the process serving the dashboard is
+# never replaced. Observed live on 2026-09-10: node PID from 09-09 still holding
+# 3131 after two updates.
+#
+# So: stop the task unconditionally (its state tells us nothing useful), then kill
+# whatever actually owns the port and wait for it to release.
 $wasRunning = $false
 $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-if ($task -and $task.State -eq 'Running') {
+if ($task) {
+  if ($task.State -eq 'Running') { $wasRunning = $true }
   Write-Host "  Stopping scheduled task..." -ForegroundColor DarkGray
-  Stop-ScheduledTask -TaskName $TaskName
-  $wasRunning = $true
+  try { Stop-ScheduledTask -TaskName $TaskName -ErrorAction Stop } catch {}
   Start-Sleep -Seconds 2
 }
+
+# Port 3131 only — never 3132. A developer's DEV server is a separate process that
+# this script has no business touching.
+$portFreed = $true
+try {
+  $listener = Get-NetTCPConnection -LocalPort 3131 -State Listen -ErrorAction SilentlyContinue
+  if ($listener) {
+    $wasRunning = $true
+    foreach ($procId in ($listener.OwningProcess | Select-Object -Unique)) {
+      $p = Get-Process -Id $procId -ErrorAction SilentlyContinue
+      if (-not $p) { continue }
+      Write-Host "  Stopping dashboard process $procId ($($p.ProcessName), started $($p.StartTime))..." -ForegroundColor DarkGray
+      try { Stop-Process -Id $procId -Force -ErrorAction Stop } catch {
+        Write-Host "  WARN: could not stop PID $procId — $($_.Exception.Message)" -ForegroundColor Yellow
+      }
+    }
+    # Wait for the socket to actually clear; a bind race here would make the new
+    # server exit and hand the port straight back to nothing.
+    $portFreed = $false
+    $waitUntil = (Get-Date).AddSeconds(15)
+    while ((Get-Date) -lt $waitUntil) {
+      if (-not (Get-NetTCPConnection -LocalPort 3131 -State Listen -ErrorAction SilentlyContinue)) { $portFreed = $true; break }
+      Start-Sleep -Milliseconds 500
+    }
+    if (-not $portFreed) {
+      Write-Host "  WARN: port 3131 is still held after 15s. The new server will refuse to start." -ForegroundColor Yellow
+    }
+  }
+} catch {}
 
 # --- Mark the update as in flight ---
 # Written before the first destructive step. See the $Marker comment above.
